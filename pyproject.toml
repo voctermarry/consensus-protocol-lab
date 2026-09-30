@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "consensus-protocol-lab"
+version = "0.1.0"
+description = "Deterministic simulation lab for Raft-style consensus protocols"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+consensus-protocol-lab = "consensus_lab.cli:main"
+
+[tool.setuptools]
+packages = ["consensus_lab"]
