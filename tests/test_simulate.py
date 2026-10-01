@@ -399,3 +399,266 @@ def test_invalid_client_commands(tmp_path, capsys, mutate):
     assert out == ""
     assert err.startswith("error: ")
     assert err.count("\n") == 1
+
+
+# -- node crash and restart -----------------------------------------------
+
+
+def _crash_scenario(**overrides):
+    return _base_scenario(
+        duration=700,
+        electionTimeouts={"a": 100, "b": 150, "c": 200},
+        heartbeatInterval=50,
+        messageDelay=10,
+        nodeEvents=[
+            {"time": 250, "node": "a", "action": "crash"},
+            {"time": 450, "node": "a", "action": "restart"},
+        ],
+        **overrides,
+    )
+
+
+def test_crashed_leader_is_silent_and_restarts_as_follower(tmp_path, capsys):
+    code, out, err = _run(tmp_path, capsys, _crash_scenario())
+    assert code == 0
+    assert err == ""
+    result = json.loads(out)
+
+    lifecycle = [
+        (e["time"], e["node"], e["event"], e.get("restartCount"))
+        for e in _by_type(result, "nodeLifecycle")
+    ]
+    assert lifecycle == [(250, "a", "crash", None), (450, "a", "restart", 1)]
+
+    # While a is down, nothing is sent by a and every inbound message drops.
+    for entry in result["timeline"]:
+        if 250 <= entry["time"] < 450:
+            if entry["type"] == "messageSend":
+                assert entry["node"] != "a"
+            if entry.get("result") == "dropped" and entry["node"] == "a":
+                assert entry["reason"] == "nodeDown"
+
+    dropped_down = [
+        e
+        for e in _by_type(result, "messageResult")
+        if e.get("reason") == "nodeDown"
+    ]
+    assert dropped_down
+
+    node_a = result["nodes"]["a"]
+    assert node_a["online"] is True
+    assert node_a["restartCount"] == 1
+    assert result["nodes"]["b"]["online"] is True
+    assert result["nodes"]["b"]["restartCount"] == 0
+
+    # The cluster elects a new leader for term 2 while a is down; a rejoins as
+    # follower and catches up. No term ever has two leaders.
+    assert result["electionSafety"]["violations"] == []
+    leaders2 = result["electionSafety"]["leadersByTerm"].get("2", [])
+    assert leaders2 == ["b"]
+    assert node_a["term"] == 2
+
+
+def test_client_command_to_down_node_is_rejected_node_down(tmp_path, capsys):
+    scenario = _crash_scenario(
+        clientCommands=[
+            {"time": 200, "node": "a", "id": "x1", "command": "one"},
+            {"time": 300, "node": "a", "id": "x2", "command": "down"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+
+    client_results = {
+        e["id"]: e for e in _by_type(result, "clientResult")
+    }
+    assert client_results["x1"]["result"] == "accepted"
+    down = client_results["x2"]
+    assert down["result"] == "rejected"
+    assert down["reason"] == "nodeDown"
+    assert down["knownLeader"] is None
+    rejected = {c["id"]: c for c in result["clients"]["rejected"]}
+    assert rejected["x2"] == {"id": "x2", "node": "a", "reason": "nodeDown", "knownLeader": None}
+    # The command accepted before the crash still commits.
+    assert [c["id"] for c in result["clients"]["committed"]] == ["x1"]
+
+
+def test_durable_state_survives_restart_without_replay(tmp_path, capsys):
+    scenario = _base_scenario(
+        duration=700,
+        electionTimeouts={"a": 100, "b": 150, "c": 200},
+        heartbeatInterval=50,
+        messageDelay=10,
+        clientCommands=[{"time": 200, "node": "a", "id": "x1", "command": "one"}],
+        nodeEvents=[
+            {"time": 250, "node": "a", "action": "crash"},
+            {"time": 450, "node": "a", "action": "restart"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    node_a = result["nodes"]["a"]
+    assert node_a["log"] == [{"index": 1, "term": 1, "id": "x1", "command": "one"}]
+    assert node_a["commitIndex"] == 1
+    assert node_a["lastApplied"] == 1
+    assert node_a["applied"] == [{"index": 1, "term": 1, "id": "x1", "command": "one"}]
+
+    # x1 is applied exactly once by a: before its crash, never replayed.
+    applies_a = [
+        e for e in _by_type(result, "applied")
+        if e["node"] == "a" and e["id"] == "x1"
+    ]
+    assert len(applies_a) == 1
+    assert applies_a[0]["time"] < 250
+
+
+def test_unreplicated_entry_survives_leader_crash_as_pending(tmp_path, capsys):
+    scenario = _base_scenario(
+        duration=600,
+        electionTimeouts={"a": 100, "b": 300, "c": 400},
+        heartbeatInterval=50,
+        messageDelay=10,
+        faults=[{"time": 200, "action": "partition", "groups": [["a"], ["b", "c"]]}],
+        nodeEvents=[
+            {"time": 201, "node": "a", "action": "crash"},
+            {"time": 350, "node": "a", "action": "restart"},
+        ],
+        clientCommands=[{"time": 200, "node": "a", "id": "p1", "command": "solo"}],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    assert result["clients"]["pending"] == [{"id": "p1", "node": "a", "index": 1, "term": 1}]
+    assert result["clients"]["committed"] == []
+    assert [e["id"] for e in result["nodes"]["a"]["log"]] == ["p1"]
+    assert all(e["id"] != "p1" for e in _by_type(result, "applied"))
+
+
+def test_restart_measures_election_timeout_from_restart_time(tmp_path, capsys):
+    scenario = _base_scenario(
+        duration=600,
+        electionTimeouts={"a": 100, "b": 400, "c": 500},
+        heartbeatInterval=200,
+        messageDelay=1000,
+        nodeEvents=[
+            {"time": 105, "node": "a", "action": "crash"},
+            {"time": 200, "node": "a", "action": "restart"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    # a first campaigned at 100 (term 1). After restart at 200 its timeout is
+    # rescheduled to 200 + 100 = 300, where it starts term 2 rather than
+    # reusing the persisted term 1.
+    changes_a = [
+        (e["time"], e["term"])
+        for e in _by_type(result, "stateChange")
+        if e["node"] == "a"
+    ]
+    assert changes_a[0] == (100, 1)
+    assert (300, 2) in changes_a
+    assert result["nodes"]["a"]["votedFor"] == "a"
+
+
+def test_node_events_deterministic(tmp_path, capsys):
+    scenario = _crash_scenario(
+        clientCommands=[{"time": 300, "node": "a", "id": "x", "command": 1}],
+    )
+    _, out1, _ = _run(tmp_path, capsys, scenario)
+    _, out2, _ = _run(tmp_path, capsys, scenario)
+    assert out1 == out2
+
+
+def test_node_ending_offline_is_reported(tmp_path, capsys):
+    scenario = _base_scenario(
+        duration=400,
+        nodeEvents=[{"time": 250, "node": "c", "action": "crash"}],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    assert result["nodes"]["c"]["online"] is False
+    assert result["nodes"]["c"]["restartCount"] == 0
+
+
+def test_empty_node_events_still_enables_new_fields(tmp_path, capsys):
+    code, out, _ = _run(tmp_path, capsys, _base_scenario(nodeEvents=[]))
+    assert code == 0
+    result = json.loads(out)
+    for node in result["nodes"].values():
+        assert node["online"] is True
+        assert node["restartCount"] == 0
+    assert _by_type(result, "nodeLifecycle") == []
+
+
+def test_node_events_absent_adds_nothing(tmp_path, capsys):
+    code, out, _ = _run(tmp_path, capsys, _base_scenario())
+    assert code == 0
+    result = json.loads(out)
+    for node in result["nodes"].values():
+        assert "online" not in node
+        assert "restartCount" not in node
+    assert _by_type(result, "nodeLifecycle") == []
+
+
+def test_same_tick_ordering_crash_before_messages_and_commands(tmp_path, capsys):
+    scenario = _base_scenario(
+        duration=200,
+        electionTimeouts={"a": 100, "b": 200, "c": 300},
+        heartbeatInterval=50,
+        messageDelay=10,
+        nodeEvents=[{"time": 110, "node": "b", "action": "crash"}],
+        clientCommands=[{"time": 110, "node": "b", "id": "q", "command": 1}],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    at_110 = [e for e in result["timeline"] if e["time"] == 110]
+    types = [e["type"] for e in at_110]
+    # nodeLifecycle (crash) precedes message delivery and the client command.
+    assert types[0] == "nodeLifecycle"
+    assert types.index("nodeLifecycle") < types.index("messageResult")
+    assert types.index("messageResult") < types.index("clientResult")
+    drop = [e for e in at_110 if e["type"] == "messageResult" and e["node"] == "b"][0]
+    assert drop["reason"] == "nodeDown"
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda s: s.update(nodeEvents="not-a-list"),
+    lambda s: s.update(nodeEvents=[1]),
+    lambda s: s.update(nodeEvents=[{"time": 1, "node": "a"}]),
+    lambda s: s.update(nodeEvents=[{"node": "a", "action": "crash"}]),
+    lambda s: s.update(nodeEvents=[{"time": 1, "action": "crash"}]),
+    lambda s: s.update(nodeEvents=[{"time": 1, "node": "a", "action": "crash", "x": 1}]),
+    lambda s: s.update(nodeEvents=[{"time": 1, "node": "a", "action": "stop"}]),
+    lambda s: s.update(nodeEvents=[{"time": 1, "node": "z", "action": "crash"}]),
+    lambda s: s.update(nodeEvents=[{"time": 1, "node": "", "action": "crash"}]),
+    lambda s: s.update(nodeEvents=[{"time": -1, "node": "a", "action": "crash"}]),
+    lambda s: s.update(nodeEvents=[{"time": 501, "node": "a", "action": "crash"}]),
+    lambda s: s.update(nodeEvents=[{"time": 1.5, "node": "a", "action": "crash"}]),
+    lambda s: s.update(nodeEvents=[{"time": 1, "node": "a", "action": "restart"}]),
+    lambda s: s.update(
+        nodeEvents=[
+            {"time": 1, "node": "a", "action": "crash"},
+            {"time": 2, "node": "a", "action": "crash"},
+        ]
+    ),
+    lambda s: s.update(
+        nodeEvents=[
+            {"time": 1, "node": "a", "action": "crash"},
+            {"time": 2, "node": "a", "action": "restart"},
+            {"time": 3, "node": "a", "action": "restart"},
+        ]
+    ),
+])
+def test_invalid_node_events(tmp_path, capsys, mutate):
+    scenario = _base_scenario()
+    mutate(scenario)
+    code, out, err = _run(tmp_path, capsys, scenario)
+    assert code == 2
+    assert out == ""
+    assert err.startswith("error: ")
+    assert err.count("\n") == 1
