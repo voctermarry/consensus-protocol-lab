@@ -15,14 +15,15 @@ ROLE_LEADER = "leader"
 
 # Event kinds, processed in this order when they share a timestamp.
 _KIND_FAULT = 0
-_KIND_MESSAGE = 1
-_KIND_CLIENT = 2
+_KIND_NODE_EVENT = 1
+_KIND_MESSAGE = 2
+_KIND_CLIENT = 3
 # Replication traffic triggered by client commands (and its replies) lands
 # here so that, even with zero message delay, all client commands sharing a
 # timestamp are handled in input order before their reactions drain.
-_KIND_REACTION = 3
-_KIND_TIMEOUT = 4
-_KIND_HEARTBEAT = 5
+_KIND_REACTION = 4
+_KIND_TIMEOUT = 5
+_KIND_HEARTBEAT = 6
 
 _TOP_LEVEL_FIELDS = {
     "nodes",
@@ -32,10 +33,12 @@ _TOP_LEVEL_FIELDS = {
     "messageDelay",
     "faults",
     "clientCommands",
+    "nodeEvents",
 }
-_REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {"faults", "clientCommands"}
+_REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {"faults", "clientCommands", "nodeEvents"}
 _FAULT_FIELDS = {"time", "action", "groups"}
 _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
+_NODE_EVENT_FIELDS = {"time", "node", "action"}
 
 
 class ScenarioError(Exception):
@@ -181,6 +184,43 @@ def parse_scenario(raw: object) -> dict:
             {"time": time, "node": node, "id": command_id, "command": command["command"]}
         )
 
+    node_events_provided = "nodeEvents" in raw
+    node_events = raw.get("nodeEvents", [])
+    if not isinstance(node_events, list):
+        raise ScenarioError("nodeEvents must be a list")
+    normalized_node_events = []
+    last_action: dict[str, str] = {}
+    for index, event in enumerate(node_events):
+        label = f"nodeEvents[{index}]"
+        if not isinstance(event, dict):
+            raise ScenarioError(f"{label} must be an object")
+        unknown = sorted(set(event) - _NODE_EVENT_FIELDS)
+        if unknown:
+            raise ScenarioError(f"{label} has unknown field(s): {', '.join(unknown)}")
+        missing = sorted(_NODE_EVENT_FIELDS - set(event))
+        if missing:
+            raise ScenarioError(f"{label} missing field(s): {', '.join(missing)}")
+        time = _require_int(event["time"], f"{label}.time", 0)
+        if time > duration:
+            raise ScenarioError(f"{label}.time is beyond the simulation duration")
+        node = event["node"]
+        if not isinstance(node, str) or not node:
+            raise ScenarioError(f"{label}.node must be a non-empty string")
+        if node not in node_set:
+            raise ScenarioError(f"{label}.node references unknown node: {node!r}")
+        action = event["action"]
+        if action not in ("crash", "restart"):
+            raise ScenarioError(f"{label}.action must be crash or restart")
+        previous = last_action.get(node)
+        if previous is None and action != "crash":
+            raise ScenarioError(f"{label}: first event for node {node!r} must be crash")
+        if previous == action:
+            raise ScenarioError(
+                f"{label}: events for node {node!r} must alternate crash and restart"
+            )
+        last_action[node] = action
+        normalized_node_events.append({"time": time, "node": node, "action": action})
+
     return {
         "nodes": list(nodes),
         "duration": duration,
@@ -189,6 +229,8 @@ def parse_scenario(raw: object) -> dict:
         "messageDelay": delay,
         "faults": normalized_faults,
         "clientCommands": normalized_commands,
+        "nodeEvents": normalized_node_events,
+        "nodeEventsProvided": node_events_provided,
     }
 
 
@@ -206,6 +248,8 @@ class _Node:
         "applied",
         "next_index",
         "match_index",
+        "online",
+        "restart_count",
     )
 
     def __init__(self) -> None:
@@ -223,6 +267,13 @@ class _Node:
         # Leader-only replication progress, keyed by peer name.
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
+        # Crash/restart lifecycle. term, voted_for, log, commit_index,
+        # last_applied and applied model persisted state: every change to them
+        # is made (synchronously) before the response that depends on it, so
+        # they survive a crash and are simply kept on restart. Everything else
+        # is volatile and is reset when the node comes back up.
+        self.online = True
+        self.restart_count = 0
 
     def last_log_index(self) -> int:
         return len(self.log)
@@ -245,6 +296,8 @@ class _Simulator:
         self.delay: int = config["messageDelay"]
         self.faults: list[dict] = config["faults"]
         self.commands: list[dict] = config["clientCommands"]
+        self.node_events: list[dict] = config["nodeEvents"]
+        self.node_events_provided: bool = config["nodeEventsProvided"]
         self.state = {name: _Node() for name in self.node_names}
         self.index = {name: i for i, name in enumerate(self.node_names)}
         self.majority = len(self.node_names) // 2 + 1
@@ -258,14 +311,17 @@ class _Simulator:
         # trigger), new messages land in the REACTION phase instead of the
         # regular MESSAGE phase.
         self.reaction_phase = False
-        # Commands rejected at the door (target was not leader) never reach a
-        # log. Final committed / superseded / pending outcomes are derived
-        # from the end state; knownLeader is captured at rejection time.
+        # Commands rejected at the door (target was not leader, or was down)
+        # never reach a log. Final committed / superseded / pending outcomes
+        # are derived from the end state; reason and knownLeader are captured
+        # at rejection time.
         self.rejected: dict[str, dict] = {}
 
     def run(self) -> dict:
         for order, fault in enumerate(self.faults):
             heapq.heappush(self.queue, (fault["time"], _KIND_FAULT, order, fault))
+        for order, event in enumerate(self.node_events):
+            heapq.heappush(self.queue, (event["time"], _KIND_NODE_EVENT, order, event))
         for order, command in enumerate(self.commands):
             heapq.heappush(self.queue, (command["time"], _KIND_CLIENT, order, command))
         for name in self.node_names:
@@ -278,6 +334,8 @@ class _Simulator:
             self.reaction_phase = kind in (_KIND_CLIENT, _KIND_REACTION)
             if kind == _KIND_FAULT:
                 self._apply_fault(payload)
+            elif kind == _KIND_NODE_EVENT:
+                self._on_node_event(payload)
             elif kind in (_KIND_MESSAGE, _KIND_REACTION):
                 self._deliver(payload)
             elif kind == _KIND_CLIENT:
@@ -422,6 +480,20 @@ class _Simulator:
 
     def _deliver(self, msg: dict) -> None:
         src, dst = msg["src"], msg["dst"]
+        if not self.state[dst].online:
+            # The destination crashed after this message was sent; it is
+            # dropped on arrival. Messages the crashed node itself sent
+            # earlier are unaffected and still land at their original time.
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": msg["kind"],
+                "term": msg["term"],
+                "result": "dropped",
+                "reason": "nodeDown",
+            })
+            return
         if not self._connected(src, dst):
             self._record({
                 "type": "messageResult",
@@ -694,8 +766,19 @@ class _Simulator:
         node = command["node"]
         command_id = command["id"]
         st = self.state[node]
+        if not st.online:
+            self.rejected[command_id] = {"node": node, "reason": "nodeDown", "knownLeader": None}
+            self._record({
+                "type": "clientResult",
+                "node": node,
+                "id": command_id,
+                "result": "rejected",
+                "reason": "nodeDown",
+                "knownLeader": None,
+            })
+            return
         if st.role != ROLE_LEADER:
-            self.rejected[command_id] = {"node": node, "knownLeader": st.known_leader}
+            self.rejected[command_id] = {"node": node, "reason": "notLeader", "knownLeader": st.known_leader}
             self._record({
                 "type": "clientResult",
                 "node": node,
@@ -758,15 +841,42 @@ class _Simulator:
 
     def _on_timeout(self, name: str, generation: int) -> None:
         st = self.state[name]
-        if generation != st.timeout_gen or st.role == ROLE_LEADER:
+        if not st.online or generation != st.timeout_gen or st.role == ROLE_LEADER:
             return
         self._record({"type": "timeout", "node": name, "term": st.term, "reason": "electionTimeout"})
         self._start_election(name)
 
     def _on_heartbeat(self, name: str, term: int) -> None:
         st = self.state[name]
-        if st.role == ROLE_LEADER and st.term == term:
+        if st.online and st.role == ROLE_LEADER and st.term == term:
             self._send_heartbeats(name)
+
+    def _on_node_event(self, event: dict) -> None:
+        name = event["node"]
+        st = self.state[name]
+        if event["action"] == "crash":
+            # The node goes silent: it sends nothing, processes nothing and
+            # fires no timeouts or heartbeats until it restarts. Persisted
+            # state (term, voted_for, log, commit_index, last_applied,
+            # applied) is kept as-is.
+            st.online = False
+            st.timeout_gen += 1  # invalidate any pending election timeout
+            self._record({"type": "nodeLifecycle", "node": name, "action": "crash"})
+            return
+        # Restart: persisted state survives; volatile state is reset. The
+        # node comes back as a follower with no known leader, no candidate
+        # votes and no leader replication progress, and its election timeout
+        # is measured from the restart moment. Recovered entries are not
+        # re-applied because last_applied/applied were restored with the log.
+        st.online = True
+        st.restart_count += 1
+        st.role = ROLE_FOLLOWER
+        st.known_leader = None
+        st.votes = set()
+        st.next_index = {}
+        st.match_index = {}
+        self._reset_timeout(name)
+        self._record({"type": "nodeLifecycle", "node": name, "action": "restart"})
 
     def _apply_fault(self, fault: dict) -> None:
         if fault["action"] == "partition":
@@ -858,7 +968,7 @@ class _Simulator:
                     {
                         "id": command_id,
                         "node": command["node"],
-                        "reason": "notLeader",
+                        "reason": rejected["reason"],
                         "knownLeader": rejected["knownLeader"],
                     }
                 )
@@ -888,6 +998,22 @@ class _Simulator:
                 grouped["superseded"].append({"id": command_id, "node": command["node"]})
         return grouped
 
+    def _node_report(self, st: _Node) -> dict:
+        report = {
+            "role": st.role,
+            "term": st.term,
+            "votedFor": st.voted_for,
+            "knownLeader": st.known_leader,
+            "log": [dict(entry) for entry in st.log],
+            "commitIndex": st.commit_index,
+            "lastApplied": st.last_applied,
+            "applied": [dict(entry) for entry in st.applied],
+        }
+        if self.node_events_provided:
+            report["online"] = st.online
+            report["restartCount"] = st.restart_count
+        return report
+
     def _report(self) -> dict:
         leaders = {str(term): names for term, names in sorted(self.leaders_by_term.items())}
         violations = [
@@ -898,16 +1024,7 @@ class _Simulator:
         return {
             "timeline": self.timeline,
             "nodes": {
-                name: {
-                    "role": st.role,
-                    "term": st.term,
-                    "votedFor": st.voted_for,
-                    "knownLeader": st.known_leader,
-                    "log": [dict(entry) for entry in st.log],
-                    "commitIndex": st.commit_index,
-                    "lastApplied": st.last_applied,
-                    "applied": [dict(entry) for entry in st.applied],
-                }
+                name: self._node_report(st)
                 for name, st in self.state.items()
             },
             "clients": self._clients_report(),
