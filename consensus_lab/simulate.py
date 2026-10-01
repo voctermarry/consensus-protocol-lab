@@ -1,4 +1,4 @@
-"""Deterministic Raft leader-election simulation.
+"""Deterministic Raft simulation: leader election, log replication and commit.
 
 The simulation advances virtual time only: it never reads the wall clock and
 never uses randomness, so identical input produces byte-identical output.
@@ -15,8 +15,9 @@ ROLE_LEADER = "leader"
 # Event kinds, processed in this order when they share a timestamp.
 _KIND_FAULT = 0
 _KIND_MESSAGE = 1
-_KIND_TIMEOUT = 2
-_KIND_HEARTBEAT = 3
+_KIND_CLIENT = 2
+_KIND_TIMEOUT = 3
+_KIND_HEARTBEAT = 4
 
 _TOP_LEVEL_FIELDS = {
     "nodes",
@@ -25,9 +26,11 @@ _TOP_LEVEL_FIELDS = {
     "heartbeatInterval",
     "messageDelay",
     "faults",
+    "clientCommands",
 }
-_REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {"faults"}
+_REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {"faults", "clientCommands"}
 _FAULT_FIELDS = {"time", "action", "groups"}
+_CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 
 
 class ScenarioError(Exception):
@@ -93,11 +96,12 @@ def parse_scenario(raw: object) -> dict:
     else:
         raise ScenarioError("electionTimeouts must be a positive integer or an object mapping node names to positive integers")
 
+    node_set = set(nodes)
+
     faults = raw.get("faults", [])
     if not isinstance(faults, list):
         raise ScenarioError("faults must be a list")
     normalized_faults = []
-    node_set = set(nodes)
     for index, fault in enumerate(faults):
         label = f"faults[{index}]"
         if not isinstance(fault, dict):
@@ -139,6 +143,37 @@ def parse_scenario(raw: object) -> dict:
         else:
             raise ScenarioError(f"{label}.action must be partition or heal")
 
+    client_commands_raw = raw.get("clientCommands", [])
+    if not isinstance(client_commands_raw, list):
+        raise ScenarioError("clientCommands must be a list")
+    normalized_commands = []
+    seen_ids: set[str] = set()
+    for index, client_command in enumerate(client_commands_raw):
+        label = f"clientCommands[{index}]"
+        if not isinstance(client_command, dict):
+            raise ScenarioError(f"{label} must be an object")
+        unknown = sorted(set(client_command) - _CLIENT_COMMAND_FIELDS)
+        if unknown:
+            raise ScenarioError(f"{label} has unknown field(s): {', '.join(unknown)}")
+        missing = sorted(_CLIENT_COMMAND_FIELDS - set(client_command))
+        if missing:
+            raise ScenarioError(f"{label} is missing field(s): {', '.join(missing)}")
+        time = _require_int(client_command["time"], f"{label}.time", 0)
+        if time > duration:
+            raise ScenarioError(f"{label}.time is beyond the simulation duration")
+        node = client_command["node"]
+        if not isinstance(node, str) or node not in node_set:
+            raise ScenarioError(f"{label}.node references unknown node: {node!r}")
+        command_id = client_command["id"]
+        if not isinstance(command_id, str) or not command_id:
+            raise ScenarioError(f"{label}.id must be a non-empty string")
+        if command_id in seen_ids:
+            raise ScenarioError(f"duplicate client command id: {command_id!r}")
+        seen_ids.add(command_id)
+        normalized_commands.append(
+            {"time": time, "node": node, "id": command_id, "command": client_command["command"]}
+        )
+
     return {
         "nodes": list(nodes),
         "duration": duration,
@@ -146,11 +181,25 @@ def parse_scenario(raw: object) -> dict:
         "heartbeatInterval": heartbeat,
         "messageDelay": delay,
         "faults": normalized_faults,
+        "clientCommands": normalized_commands,
     }
 
 
 class _Node:
-    __slots__ = ("role", "term", "voted_for", "known_leader", "votes", "timeout_gen")
+    __slots__ = (
+        "role",
+        "term",
+        "voted_for",
+        "known_leader",
+        "votes",
+        "timeout_gen",
+        "log",
+        "commit_index",
+        "last_applied",
+        "applied",
+        "next_index",
+        "match_index",
+    )
 
     def __init__(self) -> None:
         self.role = ROLE_FOLLOWER
@@ -159,6 +208,12 @@ class _Node:
         self.known_leader: str | None = None
         self.votes: set[str] = set()
         self.timeout_gen = 0
+        self.log: list[dict] = []
+        self.commit_index = 0
+        self.last_applied = 0
+        self.applied: list[dict] = []
+        self.next_index: dict[str, int] = {}
+        self.match_index: dict[str, int] = {}
 
 
 class _Simulator:
@@ -169,6 +224,7 @@ class _Simulator:
         self.heartbeat_interval: int = config["heartbeatInterval"]
         self.delay: int = config["messageDelay"]
         self.faults: list[dict] = config["faults"]
+        self.client_commands: list[dict] = config["clientCommands"]
         self.state = {name: _Node() for name in self.node_names}
         self.index = {name: i for i, name in enumerate(self.node_names)}
         self.majority = len(self.node_names) // 2 + 1
@@ -178,10 +234,15 @@ class _Simulator:
         self.queue: list[tuple] = []
         self.send_counter = 0
         self.now = 0
+        # Client command tracking, in input order.
+        self.clients: dict[str, dict] = {}
+        self.committed_ids: set[str] = set()
 
     def run(self) -> dict:
         for order, fault in enumerate(self.faults):
             heapq.heappush(self.queue, (fault["time"], _KIND_FAULT, order, fault))
+        for order, command in enumerate(self.client_commands):
+            heapq.heappush(self.queue, (command["time"], _KIND_CLIENT, order, command))
         for name in self.node_names:
             heapq.heappush(self.queue, (self.timeouts[name], _KIND_TIMEOUT, self.index[name], (name, 0)))
         while self.queue:
@@ -193,6 +254,8 @@ class _Simulator:
                 self._apply_fault(payload)
             elif kind == _KIND_MESSAGE:
                 self._deliver(payload)
+            elif kind == _KIND_CLIENT:
+                self._on_client_command(payload)
             elif kind == _KIND_TIMEOUT:
                 self._on_timeout(*payload)
             else:
@@ -237,9 +300,15 @@ class _Simulator:
         st.votes = {name}
         self._reset_timeout(name)
         self._record_state_change(name, "electionTimeout")
+        last_log_term = st.log[-1]["term"] if st.log else 0
         for peer in self.node_names:
             if peer != name:
-                self._send(name, peer, {"kind": "requestVote", "term": st.term})
+                self._send(name, peer, {
+                    "kind": "requestVote",
+                    "term": st.term,
+                    "lastLogIndex": len(st.log),
+                    "lastLogTerm": last_log_term,
+                })
 
     def _become_leader(self, name: str) -> None:
         st = self.state[name]
@@ -247,6 +316,8 @@ class _Simulator:
         st.known_leader = name
         st.votes = set()
         st.timeout_gen += 1  # leaders have no election timeout
+        st.next_index = {peer: len(st.log) + 1 for peer in self.node_names if peer != name}
+        st.match_index = {peer: 0 for peer in self.node_names if peer != name}
         self._record_state_change(name, "majority")
         leaders = self.leaders_by_term.setdefault(st.term, [])
         if name not in leaders:
@@ -271,6 +342,21 @@ class _Simulator:
             (self.now + self.heartbeat_interval, _KIND_HEARTBEAT, self.index[name], (name, st.term)),
         )
 
+    def _send_append_entries(self, name: str, peer: str) -> None:
+        st = self.state[name]
+        next_index = st.next_index.get(peer, len(st.log) + 1)
+        prev_index = next_index - 1
+        prev_term = st.log[prev_index - 1]["term"] if prev_index > 0 else 0
+        entries = [dict(entry) for entry in st.log[next_index - 1:]]
+        self._send(name, peer, {
+            "kind": "appendEntries",
+            "term": st.term,
+            "prevLogIndex": prev_index,
+            "prevLogTerm": prev_term,
+            "entries": entries,
+            "leaderCommit": st.commit_index,
+        })
+
     def _connected(self, a: str, b: str) -> bool:
         if self.partition is None:
             return True
@@ -293,6 +379,10 @@ class _Simulator:
             self._handle_request_vote(msg)
         elif msg["kind"] == "voteReply":
             self._handle_vote_reply(msg)
+        elif msg["kind"] == "appendEntries":
+            self._handle_append_entries(msg)
+        elif msg["kind"] == "appendEntriesReply":
+            self._handle_append_entries_reply(msg)
         else:
             self._handle_heartbeat(msg)
 
@@ -301,7 +391,16 @@ class _Simulator:
         st = self.state[dst]
         # A higher term clears voted_for before the vote decision is made.
         effective_voted_for = None if msg["term"] > st.term else st.voted_for
-        granted = msg["term"] >= st.term and (effective_voted_for is None or effective_voted_for == src)
+        # The candidate's log must be at least as up-to-date as the voter's.
+        last_log_term = st.log[-1]["term"] if st.log else 0
+        up_to_date = msg["lastLogTerm"] > last_log_term or (
+            msg["lastLogTerm"] == last_log_term and msg["lastLogIndex"] >= len(st.log)
+        )
+        granted = (
+            msg["term"] >= st.term
+            and (effective_voted_for is None or effective_voted_for == src)
+            and up_to_date
+        )
         self._record({
             "type": "messageResult",
             "node": dst,
@@ -363,6 +462,224 @@ class _Simulator:
             self._reset_timeout(dst)
         st.known_leader = src
 
+    def _handle_append_entries(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        if msg["term"] < st.term:
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": "appendEntries",
+                "term": msg["term"],
+                "result": "delivered",
+                "detail": "staleTerm",
+            })
+            self._send(dst, src, {
+                "kind": "appendEntriesReply",
+                "term": st.term,
+                "success": False,
+                "matchIndex": len(st.log),
+            })
+            return
+        prev_index = msg["prevLogIndex"]
+        entries = msg["entries"]
+        if prev_index > len(st.log):
+            detail, success = "missingPrefix", False
+        elif prev_index > 0 and st.log[prev_index - 1]["term"] != msg["prevLogTerm"]:
+            detail, success = "conflict", False
+        else:
+            detail, success = "accepted", True
+        self._record({
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "appendEntries",
+            "term": msg["term"],
+            "result": "delivered",
+            "detail": detail,
+        })
+        if msg["term"] > st.term or st.role != ROLE_FOLLOWER:
+            self._become_follower(dst, msg["term"], "appendEntries")
+        else:
+            self._reset_timeout(dst)
+        st.known_leader = src
+        if success:
+            self._merge_entries(dst, prev_index, entries)
+            if msg["leaderCommit"] > st.commit_index:
+                st.commit_index = min(msg["leaderCommit"], len(st.log))
+                self._apply_committed(dst)
+        elif detail == "conflict":
+            # Delete the conflicting entry and everything after it.
+            self._truncate_log(dst, prev_index)
+        match_index = prev_index + len(entries) if success else len(st.log)
+        self._send(dst, src, {
+            "kind": "appendEntriesReply",
+            "term": st.term,
+            "success": success,
+            "matchIndex": match_index,
+        })
+
+    def _handle_append_entries_reply(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        detail = "ignored"
+        if msg["term"] > st.term:
+            detail = "higherTerm"
+        elif st.role == ROLE_LEADER and msg["term"] == st.term:
+            if msg["success"]:
+                detail = "accepted"
+                st.match_index[src] = max(st.match_index.get(src, 0), msg["matchIndex"])
+                st.next_index[src] = st.match_index[src] + 1
+            else:
+                detail = "rejected"
+                # Deterministic backoff: step one entry back and retry.
+                st.next_index[src] = max(1, st.next_index.get(src, len(st.log) + 1) - 1)
+        self._record({
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "appendEntriesReply",
+            "term": msg["term"],
+            "result": "delivered",
+            "detail": detail,
+        })
+        if msg["term"] > st.term:
+            self._become_follower(dst, msg["term"], "higherTermMessage")
+        elif detail == "accepted":
+            self._advance_commit(dst)
+        elif detail == "rejected":
+            self._send_append_entries(dst, src)
+
+    # -- log replication ------------------------------------------------------
+
+    def _merge_entries(self, name: str, prev_index: int, entries: list[dict]) -> None:
+        st = self.state[name]
+        for offset, entry in enumerate(entries):
+            index = prev_index + 1 + offset
+            if index <= len(st.log):
+                if st.log[index - 1]["term"] != entry["term"]:
+                    self._truncate_log(name, index)
+                    st.log.extend(dict(e) for e in entries[offset:])
+                    break
+                # Already have this entry; keep going.
+            else:
+                st.log.extend(dict(e) for e in entries[offset:])
+                break
+
+    def _truncate_log(self, name: str, index: int) -> None:
+        st = self.state[name]
+        removed = st.log[index - 1:]
+        del st.log[index - 1:]
+        for entry in removed:
+            self._mark_superseded(name, entry, "logOverwritten")
+
+    def _apply_committed(self, name: str) -> None:
+        st = self.state[name]
+        while st.last_applied < st.commit_index:
+            st.last_applied += 1
+            entry = st.log[st.last_applied - 1]
+            st.applied.append({"index": entry["index"], "id": entry["id"], "command": entry["command"]})
+            self._record({"type": "apply", "node": name, "index": entry["index"], "id": entry["id"]})
+
+    def _advance_commit(self, name: str) -> None:
+        st = self.state[name]
+        new_commit = st.commit_index
+        for index in range(len(st.log), st.commit_index, -1):
+            if st.log[index - 1]["term"] != st.term:
+                continue  # only current-term entries advance the commit index
+            replicated = 1 + sum(1 for match in st.match_index.values() if match >= index)
+            if replicated >= self.majority:
+                new_commit = index
+                break
+        if new_commit == st.commit_index:
+            return
+        st.commit_index = new_commit
+        self._apply_committed(name)
+        for entry in st.log[:new_commit]:
+            command_id = entry["id"]
+            if command_id in self.clients and command_id not in self.committed_ids:
+                self.committed_ids.add(command_id)
+                self.clients[command_id]["status"] = "committed"
+                self._record({
+                    "type": "clientResult",
+                    "node": name,
+                    "id": command_id,
+                    "result": "committed",
+                    "index": entry["index"],
+                    "term": entry["term"],
+                })
+        # Pending commands whose slot was committed to a different entry can
+        # never commit now.
+        for command_id, record in self.clients.items():
+            if record["status"] == "pending" and record["index"] <= new_commit:
+                if st.log[record["index"] - 1]["id"] != command_id:
+                    record["status"] = "superseded"
+                    self._record({
+                        "type": "clientResult",
+                        "node": name,
+                        "id": command_id,
+                        "result": "superseded",
+                        "index": record["index"],
+                        "term": record["term"],
+                        "reason": "conflictingEntryCommitted",
+                    })
+        for peer in self.node_names:
+            if peer != name:
+                self._send_append_entries(name, peer)
+
+    # -- client commands ------------------------------------------------------
+
+    def _on_client_command(self, command: dict) -> None:
+        name = command["node"]
+        command_id = command["id"]
+        st = self.state[name]
+        record = {"node": name, "time": command["time"], "status": "pending"}
+        self.clients[command_id] = record
+        if st.role != ROLE_LEADER:
+            record["status"] = "rejected"
+            record["knownLeader"] = st.known_leader
+            self._record({
+                "type": "clientResult",
+                "node": name,
+                "id": command_id,
+                "result": "rejected",
+                "reason": "notLeader",
+                "knownLeader": st.known_leader,
+            })
+            return
+        entry = {"index": len(st.log) + 1, "term": st.term, "id": command_id, "command": command["command"]}
+        st.log.append(entry)
+        record["index"] = entry["index"]
+        record["term"] = entry["term"]
+        self._record({
+            "type": "clientResult",
+            "node": name,
+            "id": command_id,
+            "result": "accepted",
+            "index": entry["index"],
+            "term": entry["term"],
+        })
+        for peer in self.node_names:
+            if peer != name:
+                self._send_append_entries(name, peer)
+
+    def _mark_superseded(self, name: str, entry: dict, reason: str) -> None:
+        command_id = entry["id"]
+        record = self.clients.get(command_id)
+        if record is None or record["status"] != "pending" or record["node"] != name:
+            return
+        record["status"] = "superseded"
+        self._record({
+            "type": "clientResult",
+            "node": name,
+            "id": command_id,
+            "result": "superseded",
+            "index": entry["index"],
+            "term": entry["term"],
+            "reason": reason,
+        })
+
     # -- timeouts, heartbeats, faults ---------------------------------------
 
     def _on_timeout(self, name: str, generation: int) -> None:
@@ -387,6 +704,35 @@ class _Simulator:
 
     # -- report ---------------------------------------------------------------
 
+    def _log_matching_violations(self) -> list[dict]:
+        violations = []
+        for i, first in enumerate(self.node_names):
+            for second in self.node_names[i + 1:]:
+                log_a = self.state[first].log
+                log_b = self.state[second].log
+                for pos in range(min(len(log_a), len(log_b))):
+                    if log_a[pos]["term"] == log_b[pos]["term"] and log_a[:pos] != log_b[:pos]:
+                        violations.append({
+                            "index": pos + 1,
+                            "term": log_a[pos]["term"],
+                            "nodes": [first, second],
+                        })
+        violations.sort(key=lambda v: (v["index"], v["nodes"]))
+        return violations
+
+    def _state_machine_violations(self) -> list[dict]:
+        applied_by_index: dict[int, dict[str, object]] = {}
+        for name in self.node_names:
+            for applied in self.state[name].applied:
+                applied_by_index.setdefault(applied["index"], {})[name] = applied["command"]
+        violations = []
+        for index in sorted(applied_by_index):
+            commands = applied_by_index[index]
+            values = list(commands.values())
+            if any(value != values[0] for value in values[1:]):
+                violations.append({"index": index, "applied": commands})
+        return violations
+
     def _report(self) -> dict:
         leaders = {str(term): names for term, names in sorted(self.leaders_by_term.items())}
         violations = [
@@ -394,6 +740,15 @@ class _Simulator:
             for term, names in sorted(self.leaders_by_term.items())
             if len(names) > 1
         ]
+        clients = {}
+        for command_id, record in self.clients.items():
+            summary = {"node": record["node"], "time": record["time"], "status": record["status"]}
+            if record["status"] == "rejected":
+                summary["knownLeader"] = record["knownLeader"]
+            else:
+                summary["index"] = record["index"]
+                summary["term"] = record["term"]
+            clients[command_id] = summary
         return {
             "timeline": self.timeline,
             "nodes": {
@@ -402,12 +757,23 @@ class _Simulator:
                     "term": st.term,
                     "votedFor": st.voted_for,
                     "knownLeader": st.known_leader,
+                    "log": [dict(entry) for entry in st.log],
+                    "commitIndex": st.commit_index,
+                    "lastApplied": st.last_applied,
+                    "applied": [dict(entry) for entry in st.applied],
                 }
                 for name, st in self.state.items()
             },
+            "clients": clients,
             "electionSafety": {
                 "leadersByTerm": leaders,
                 "violations": violations,
+            },
+            "logMatching": {
+                "violations": self._log_matching_violations(),
+            },
+            "stateMachineSafety": {
+                "violations": self._state_machine_violations(),
             },
         }
 
