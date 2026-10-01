@@ -579,3 +579,275 @@ def test_invalid_node_events(tmp_path, capsys, mutate):
     assert out == ""
     assert err.startswith("error: ")
     assert err.count("\n") == 1
+
+
+# -- snapshots and log compaction --------------------------------------------
+
+
+def _snapshot_scenario(**overrides):
+    return _base_scenario(
+        duration=400,
+        snapshotThreshold=2,
+        clientCommands=[
+            {"time": 200, "node": "a", "id": "x1", "command": "one"},
+            {"time": 210, "node": "a", "id": "x2", "command": "two"},
+            {"time": 220, "node": "a", "id": "x3", "command": "three"},
+        ],
+        **overrides,
+    )
+
+
+def test_snapshot_compacts_prefix_keeps_global_indices(tmp_path, capsys):
+    code, out, err = _run(tmp_path, capsys, _snapshot_scenario())
+    assert code == 0
+    assert err == ""
+    result = json.loads(out)
+
+    for name, node in result["nodes"].items():
+        # Only the uncompacted suffix remains, still globally indexed.
+        assert node["snapshot"] == {"lastIncludedIndex": 2, "lastIncludedTerm": 1}
+        assert node["log"] == [
+            {"index": 3, "term": 1, "id": "x3", "command": "three"}
+        ]
+        assert node["commitIndex"] == 3
+        assert node["lastApplied"] == 3
+        # Applied history is complete and de-duplicated.
+        assert [(e["index"], e["id"]) for e in node["applied"]] == [
+            (1, "x1"),
+            (2, "x2"),
+            (3, "x3"),
+        ]
+
+    created = _by_type(result, "snapshotCreated")
+    assert sorted((e["node"], e["lastIncludedIndex"], e["lastIncludedTerm"]) for e in created) == [
+        ("a", 2, 1),
+        ("b", 2, 1),
+        ("c", 2, 1),
+    ]
+    # The snapshot fires after the two applied entries it covers.
+    for node_name in ("a", "b", "c"):
+        node_events = [e for e in created if e["node"] == node_name]
+        assert len(node_events) == 1
+
+    assert result["clients"]["committed"] == [
+        {"id": "x1", "node": "a", "index": 1, "term": 1},
+        {"id": "x2", "node": "a", "index": 2, "term": 1},
+        {"id": "x3", "node": "a", "index": 3, "term": 1},
+    ]
+    assert result["logMatching"] == {"violations": []}
+    assert result["stateMachineSafety"] == {"violations": []}
+
+
+def test_snapshot_field_null_when_none_created(tmp_path, capsys):
+    scenario = _base_scenario(duration=300, snapshotThreshold=5)
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    for node in result["nodes"].values():
+        assert node["snapshot"] is None
+        assert node["log"] == []
+    assert not _by_type(result, "snapshotCreated")
+    assert not _by_type(result, "snapshotInstalled")
+
+
+def test_no_snapshot_threshold_has_no_snapshot_field(tmp_path, capsys):
+    code, out, _ = _run(tmp_path, capsys, _base_scenario())
+    assert code == 0
+    result = json.loads(out)
+    for node in result["nodes"].values():
+        assert "snapshot" not in node
+    assert not [
+        e
+        for e in result["timeline"]
+        if e["type"] in ("snapshotCreated", "snapshotInstalled")
+    ]
+
+
+def test_snapshot_creation_timing_after_applied(tmp_path, capsys):
+    code, out, _ = _run(tmp_path, capsys, _snapshot_scenario())
+    assert code == 0
+    result = json.loads(out)
+    created = next(e for e in result["timeline"] if e["type"] == "snapshotCreated" and e["node"] == "a")
+    applied_before = [
+        e
+        for e in result["timeline"]
+        if e["type"] == "applied" and e["node"] == "a" and e["seq"] < created["seq"]
+    ]
+    assert [(e["index"], e["id"]) for e in applied_before] == [(1, "x1"), (2, "x2")]
+    # Global seq stays contiguous with the new event types interleaved.
+    seqs = [e["seq"] for e in result["timeline"]]
+    assert seqs == list(range(1, len(seqs) + 1))
+
+
+def test_install_snapshot_dropped_stale_and_installed(tmp_path, capsys):
+    scenario = _base_scenario(
+        duration=700,
+        snapshotThreshold=3,
+        faults=[
+            {"time": 150, "action": "partition", "groups": [["a", "b"], ["c"]]},
+            {"time": 450, "action": "heal"},
+        ],
+        clientCommands=[
+            {"time": 200, "node": "a", "id": "x1", "command": "one"},
+            {"time": 220, "node": "a", "id": "x2", "command": "two"},
+            {"time": 240, "node": "a", "id": "x3", "command": "three"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+
+    delivers = [
+        (e["result"], e.get("reason"))
+        for e in result["timeline"]
+        if e["type"] == "messageResult" and e["message"] == "installSnapshot"
+    ]
+    assert ("dropped", "partition") in delivers
+    assert ("staleTerm", None) in delivers
+    assert ("installed", None) in delivers
+
+    installed = _by_type(result, "snapshotInstalled")
+    assert [(e["node"], e["peer"], e["lastIncludedIndex"], e["lastIncludedTerm"]) for e in installed] == [
+        ("c", "a", 3, 1)
+    ]
+
+    node_c = result["nodes"]["c"]
+    assert node_c["snapshot"] == {"lastIncludedIndex": 3, "lastIncludedTerm": 1}
+    assert node_c["log"] == []
+    assert node_c["commitIndex"] == 3
+    assert node_c["lastApplied"] == 3
+    assert [e["id"] for e in node_c["applied"]] == ["x1", "x2", "x3"]
+
+    # The snapshot restored c's state machine without emitting applied events.
+    assert not [
+        e for e in result["timeline"] if e["type"] == "applied" and e["node"] == "c"
+    ]
+
+    assert result["clients"]["committed"] == [
+        {"id": "x1", "node": "a", "index": 1, "term": 1},
+        {"id": "x2", "node": "a", "index": 2, "term": 1},
+        {"id": "x3", "node": "a", "index": 3, "term": 1},
+    ]
+    assert result["logMatching"] == {"violations": []}
+    assert result["stateMachineSafety"] == {"violations": []}
+
+
+def test_install_snapshot_ignored_duplicate_in_flight(tmp_path, capsys):
+    # Heartbeat shorter than the message delay leaves identical snapshots in
+    # flight; after the first installs, the duplicates arrive and are ignored.
+    scenario = _base_scenario(
+        duration=700,
+        electionTimeouts={"a": 100, "b": 150, "c": 500},
+        heartbeatInterval=30,
+        messageDelay=40,
+        snapshotThreshold=3,
+        faults=[
+            {"time": 150, "action": "partition", "groups": [["a", "b"], ["c"]]},
+            {"time": 320, "action": "heal"},
+        ],
+        clientCommands=[
+            {"time": 200, "node": "a", "id": "x1", "command": 1},
+            {"time": 205, "node": "a", "id": "x2", "command": 2},
+            {"time": 210, "node": "a", "id": "x3", "command": 3},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    results = [
+        e["result"]
+        for e in result["timeline"]
+        if e["type"] == "messageResult" and e["message"] == "installSnapshot"
+    ]
+    assert results.count("installed") == 1
+    assert "ignored" in results
+    # Only one actual state restore.
+    assert len(_by_type(result, "snapshotInstalled")) == 1
+
+
+def test_install_snapshot_dropped_for_down_node(tmp_path, capsys):
+    scenario = _base_scenario(
+        duration=420,
+        electionTimeouts={"a": 100, "b": 150, "c": 500},
+        heartbeatInterval=30,
+        messageDelay=40,
+        snapshotThreshold=3,
+        faults=[
+            {"time": 150, "action": "partition", "groups": [["a", "b"], ["c"]]},
+            {"time": 320, "action": "heal"},
+        ],
+        nodeEvents=[{"time": 300, "node": "c", "action": "crash"}],
+        clientCommands=[
+            {"time": 200, "node": "a", "id": "x1", "command": 1},
+            {"time": 205, "node": "a", "id": "x2", "command": 2},
+            {"time": 210, "node": "a", "id": "x3", "command": 3},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    delivers = [
+        (e["result"], e.get("reason"))
+        for e in result["timeline"]
+        if e["type"] == "messageResult" and e["message"] == "installSnapshot"
+    ]
+    assert delivers
+    assert all(result_ == "dropped" and reason == "nodeDown" for result_, reason in delivers)
+
+
+def test_snapshot_persists_across_restart_without_reapply(tmp_path, capsys):
+    scenario = _base_scenario(
+        duration=700,
+        snapshotThreshold=2,
+        clientCommands=[
+            {"time": 200, "node": "a", "id": "x1", "command": "one"},
+            {"time": 210, "node": "a", "id": "x2", "command": "two"},
+            {"time": 220, "node": "a", "id": "x3", "command": "three"},
+        ],
+        nodeEvents=[
+            {"time": 250, "node": "a", "action": "crash"},
+            {"time": 400, "node": "a", "action": "restart"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+
+    node_a = result["nodes"]["a"]
+    assert node_a["snapshot"] == {"lastIncludedIndex": 2, "lastIncludedTerm": 1}
+    assert node_a["log"] == [{"index": 3, "term": 1, "id": "x3", "command": "three"}]
+    assert [e["id"] for e in node_a["applied"]] == ["x1", "x2", "x3"]
+    assert node_a["lastApplied"] == 3
+
+    applied_a = [(e["time"], e["index"]) for e in _by_type(result, "applied") if e["node"] == "a"]
+    assert all(time_ < 250 for time_, _ in applied_a)
+    assert [index for _, index in applied_a] == [1, 2, 3]
+
+
+def test_snapshot_replication_is_deterministic(tmp_path, capsys):
+    scenario = _base_scenario(
+        duration=700,
+        snapshotThreshold=3,
+        faults=[
+            {"time": 150, "action": "partition", "groups": [["a", "b"], ["c"]]},
+            {"time": 450, "action": "heal"},
+        ],
+        clientCommands=[
+            {"time": 200, "node": "a", "id": "x1", "command": 1},
+            {"time": 220, "node": "a", "id": "x2", "command": 2},
+            {"time": 240, "node": "a", "id": "x3", "command": 3},
+        ],
+    )
+    _, out1, _ = _run(tmp_path, capsys, scenario)
+    _, out2, _ = _run(tmp_path, capsys, scenario)
+    assert out1 == out2
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2", None, [], {}])
+def test_invalid_snapshot_threshold(tmp_path, capsys, value):
+    scenario = _base_scenario(snapshotThreshold=value)
+    code, out, err = _run(tmp_path, capsys, scenario)
+    assert code == 2
+    assert out == ""
+    assert err.startswith("error: ")
+    assert err.count("\n") == 1

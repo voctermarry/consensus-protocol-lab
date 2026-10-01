@@ -34,8 +34,14 @@ _TOP_LEVEL_FIELDS = {
     "faults",
     "clientCommands",
     "nodeEvents",
+    "snapshotThreshold",
 }
-_REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {"faults", "clientCommands", "nodeEvents"}
+_REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
+    "faults",
+    "clientCommands",
+    "nodeEvents",
+    "snapshotThreshold",
+}
 _FAULT_FIELDS = {"time", "action", "groups"}
 _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 _NODE_EVENT_FIELDS = {"time", "node", "action"}
@@ -221,6 +227,12 @@ def parse_scenario(raw: object) -> dict:
         last_action[node] = action
         normalized_node_events.append({"time": time, "node": node, "action": action})
 
+    snapshot_threshold = None
+    if "snapshotThreshold" in raw:
+        snapshot_threshold = _require_int(
+            raw["snapshotThreshold"], "snapshotThreshold", 1
+        )
+
     return {
         "nodes": list(nodes),
         "duration": duration,
@@ -231,6 +243,8 @@ def parse_scenario(raw: object) -> dict:
         "clientCommands": normalized_commands,
         "nodeEvents": normalized_node_events,
         "nodeEventsProvided": node_events_provided,
+        "snapshotThreshold": snapshot_threshold,
+        "snapshotEnabled": snapshot_threshold is not None,
     }
 
 
@@ -243,6 +257,9 @@ class _Node:
         "votes",
         "timeout_gen",
         "log",
+        "snapshot_index",
+        "snapshot_term",
+        "snapshot_state",
         "commit_index",
         "last_applied",
         "applied",
@@ -259,32 +276,53 @@ class _Node:
         self.known_leader: str | None = None
         self.votes: set[str] = set()
         self.timeout_gen = 0
-        # Log entries are 1-indexed: {"index", "term", "id", "command"}.
+        # Log entries keep their global 1-based indices: with a snapshot the
+        # list holds only the uncompacted suffix, so log[0] has global index
+        # snapshot_index + 1. Entries are {"index", "term", "id", "command"}.
         self.log: list[dict] = []
+        # Persisted snapshot. The captured state is the full sequence of
+        # applied entries (complete, de-duplicated history) up to and
+        # including snapshot_index; None when no snapshot exists yet.
+        self.snapshot_index = 0
+        self.snapshot_term = 0
+        self.snapshot_state: list[dict] | None = None
         self.commit_index = 0
         self.last_applied = 0
         self.applied: list[dict] = []
         # Leader-only replication progress, keyed by peer name.
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
-        # Crash/restart lifecycle. term, voted_for, log, commit_index,
-        # last_applied and applied model persisted state: every change to them
-        # is made (synchronously) before the response that depends on it, so
-        # they survive a crash and are simply kept on restart. Everything else
-        # is volatile and is reset when the node comes back up.
+        # Crash/restart lifecycle. term, voted_for, log, snapshot state,
+        # commit_index, last_applied and applied model persisted state: every
+        # change to them is made (synchronously) before the response that
+        # depends on it, so they survive a crash and are simply kept on
+        # restart. Everything else is volatile and is reset when the node
+        # comes back up.
         self.online = True
         self.restart_count = 0
 
     def last_log_index(self) -> int:
-        return len(self.log)
+        # The snapshot covers a prefix of the global log even though those
+        # entries no longer live in self.log.
+        return self.snapshot_index + len(self.log)
 
     def last_log_term(self) -> int:
-        return self.log[-1]["term"] if self.log else 0
+        return self.log[-1]["term"] if self.log else self.snapshot_term
 
     def term_at(self, index: int) -> int:
         if index <= 0:
             return 0
-        return self.log[index - 1]["term"]
+        if index == self.snapshot_index:
+            return self.snapshot_term
+        if index < self.snapshot_index:
+            raise KeyError(f"term at compacted index {index}")
+        return self.log[index - self.snapshot_index - 1]["term"]
+
+    def entry_at(self, index: int) -> dict:
+        """The globally-indexed entry, which must still be present (in the
+        uncompacted suffix) — entries at or before snapshot_index live only
+        in the snapshot state."""
+        return self.log[index - self.snapshot_index - 1]
 
 
 class _Simulator:
@@ -298,6 +336,8 @@ class _Simulator:
         self.commands: list[dict] = config["clientCommands"]
         self.node_events: list[dict] = config["nodeEvents"]
         self.node_events_provided: bool = config["nodeEventsProvided"]
+        self.snapshot_threshold: int | None = config["snapshotThreshold"]
+        self.snapshot_enabled: bool = config["snapshotEnabled"]
         self.state = {name: _Node() for name in self.node_names}
         self.index = {name: i for i, name in enumerate(self.node_names)}
         self.majority = len(self.node_names) // 2 + 1
@@ -455,11 +495,26 @@ class _Simulator:
         )
 
     def _replicate_to(self, name: str, peer: str) -> None:
-        """Send the next due appendEntries message for one peer."""
+        """Send the next due replication message for one peer: an
+        installSnapshot when the peer's next position has been compacted
+        away, otherwise an appendEntries for the uncompacted suffix."""
         st = self.state[name]
         next_idx = st.next_index[peer]
+        if next_idx <= st.snapshot_index:
+            self._send(
+                name,
+                peer,
+                {
+                    "kind": "installSnapshot",
+                    "term": st.term,
+                    "lastIncludedIndex": st.snapshot_index,
+                    "lastIncludedTerm": st.snapshot_term,
+                    "state": [dict(entry) for entry in st.snapshot_state],
+                },
+            )
+            return
         prev_idx = next_idx - 1
-        entries = [dict(entry) for entry in st.log[prev_idx:]]
+        entries = [dict(entry) for entry in st.log[prev_idx - st.snapshot_index:]]
         self._send(
             name,
             peer,
@@ -514,6 +569,10 @@ class _Simulator:
             self._handle_heartbeat(msg)
         elif kind == "appendEntries":
             self._handle_append_entries(msg)
+        elif kind == "installSnapshot":
+            self._handle_install_snapshot(msg)
+        elif kind == "snapshotReply":
+            self._handle_snapshot_reply(msg)
         else:
             self._handle_append_reply(msg)
 
@@ -626,7 +685,12 @@ class _Simulator:
         st.known_leader = src
 
         prev_index = msg["prevLogIndex"]
-        prefix_ok = prev_index <= st.last_log_index() and st.term_at(prev_index) == msg["prevLogTerm"]
+        if prev_index < st.snapshot_index:
+            # The requested prefix position has been compacted away here;
+            # only an installSnapshot can bridge that gap.
+            prefix_ok = False
+        else:
+            prefix_ok = prev_index <= st.last_log_index() and st.term_at(prev_index) == msg["prevLogTerm"]
         if not prefix_ok:
             self._record({
                 "type": "messageResult",
@@ -649,9 +713,13 @@ class _Simulator:
         conflict_index = 0
         for offset, entry in enumerate(msg["entries"]):
             index = prev_index + 1 + offset
-            if index <= st.last_log_index() and st.log[index - 1]["term"] != entry["term"]:
+            if (
+                index > st.snapshot_index
+                and index <= st.last_log_index()
+                and st.entry_at(index)["term"] != entry["term"]
+            ):
                 conflict_index = index
-                del st.log[index - 1 :]
+                del st.log[index - st.snapshot_index - 1 :]
                 break
 
         # Append whatever is not already present with a matching term.
@@ -760,6 +828,189 @@ class _Simulator:
         })
         self._replicate_to(dst, src)
 
+    def _handle_install_snapshot(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        included_index = msg["lastIncludedIndex"]
+        included_term = msg["lastIncludedTerm"]
+        if msg["term"] < st.term:
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": "installSnapshot",
+                "term": msg["term"],
+                "result": "staleTerm",
+                "lastIncludedIndex": included_index,
+            })
+            self._send(
+                dst,
+                src,
+                {
+                    "kind": "snapshotReply",
+                    "term": st.term,
+                    "lastIncludedIndex": included_index,
+                    "status": "staleTerm",
+                },
+            )
+            return
+
+        # A higher term still makes the receiver step down, exactly as for
+        # any other current-term-or-newer leader message.
+        if msg["term"] > st.term or st.role != ROLE_FOLLOWER:
+            self._become_follower(dst, msg["term"], "installSnapshot")
+        else:
+            self._reset_timeout(dst)
+        st.known_leader = src
+
+        if included_index <= st.snapshot_index:
+            # Same-term snapshot that is no newer than the one already held.
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": "installSnapshot",
+                "term": msg["term"],
+                "result": "ignored",
+                "lastIncludedIndex": included_index,
+            })
+            self._send(
+                dst,
+                src,
+                {
+                    "kind": "snapshotReply",
+                    "term": st.term,
+                    "lastIncludedIndex": included_index,
+                    "status": "ignored",
+                },
+            )
+            return
+
+        # Accept the snapshot. A suffix past the included point survives only
+        # when the local entry at that index carries the same term; otherwise
+        # it is discarded.
+        kept: list[dict] = []
+        if (
+            included_index <= st.last_log_index()
+            and st.term_at(included_index) == included_term
+        ):
+            kept = [dict(entry) for entry in st.log[included_index - st.snapshot_index:]]
+        old_applied = st.applied
+        old_last_applied = st.last_applied
+        st.snapshot_state = [dict(entry) for entry in msg["state"]]
+        st.snapshot_index = included_index
+        st.snapshot_term = included_term
+        st.log = kept
+        # Restore the applied state captured in the snapshot without emitting
+        # applied events again. Surviving suffix entries that had already been
+        # applied stay applied as well.
+        retained_applied = max(
+            0, min(old_last_applied, included_index + len(kept)) - included_index
+        )
+        restored = [dict(entry) for entry in msg["state"]]
+        restored.extend(
+            dict(entry)
+            for entry in old_applied[included_index:included_index + retained_applied]
+        )
+        st.applied = restored
+        # Push the commit/apply watermarks at least to the snapshot point.
+        if st.commit_index < included_index:
+            st.commit_index = included_index
+        st.last_applied = included_index + retained_applied
+        self._record({
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "installSnapshot",
+            "term": msg["term"],
+            "result": "installed",
+            "lastIncludedIndex": included_index,
+            "lastLogIndex": st.last_log_index(),
+        })
+        self._record({
+            "type": "snapshotInstalled",
+            "node": dst,
+            "peer": src,
+            "lastIncludedIndex": included_index,
+            "lastIncludedTerm": included_term,
+        })
+        self._advance_apply(dst)
+        self._send(
+            dst,
+            src,
+            {
+                "kind": "snapshotReply",
+                "term": st.term,
+                "lastIncludedIndex": included_index,
+                "status": "installed",
+            },
+        )
+
+    def _handle_snapshot_reply(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        included_index = msg["lastIncludedIndex"]
+        if msg["term"] > st.term:
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": "snapshotReply",
+                "term": msg["term"],
+                "result": "delivered",
+                "detail": "higherTerm",
+            })
+            self._become_follower(dst, msg["term"], "higherTermMessage")
+            return
+        if st.role != ROLE_LEADER or msg["term"] != st.term:
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": "snapshotReply",
+                "term": msg["term"],
+                "result": "delivered",
+                "detail": "ignored",
+            })
+            return
+
+        status = msg["status"]
+        if status in ("installed", "ignored"):
+            # The peer now holds everything through the included index; resume
+            # normal log copying from the entry after the snapshot.
+            advanced = included_index > st.match_index[src]
+            if advanced:
+                st.match_index[src] = included_index
+                if included_index + 1 > st.next_index[src]:
+                    st.next_index[src] = included_index + 1
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": "snapshotReply",
+                "term": msg["term"],
+                "result": "delivered",
+                "detail": status,
+                "matchIndex": st.match_index[src],
+            })
+            if advanced:
+                self._advance_leader_commit(dst)
+            if st.last_log_index() > included_index:
+                self._replicate_to(dst, src)
+            return
+
+        # staleTerm: the receiver's reply term was not higher, so nothing
+        # advances; the regular heartbeat cadence retries.
+        self._record({
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "snapshotReply",
+            "term": msg["term"],
+            "result": "delivered",
+            "detail": "staleTerm",
+        })
+
     # -- client commands ----------------------------------------------------
 
     def _on_client_command(self, command: dict) -> None:
@@ -825,7 +1076,7 @@ class _Simulator:
         st = self.state[name]
         while st.last_applied < st.commit_index:
             st.last_applied += 1
-            entry = st.log[st.last_applied - 1]
+            entry = st.entry_at(st.last_applied)
             st.applied.append(
                 {"index": entry["index"], "term": entry["term"], "id": entry["id"], "command": entry["command"]}
             )
@@ -836,6 +1087,33 @@ class _Simulator:
                 "term": entry["term"],
                 "id": entry["id"],
             })
+            self._maybe_snapshot(name)
+
+    def _maybe_snapshot(self, name: str) -> None:
+        """Compact once the applied distance from the current snapshot point
+        reaches the threshold. The snapshot captures the index, the term and
+        the applied state; preceding log entries are deleted while global
+        indices everywhere else are left untouched."""
+        if self.snapshot_threshold is None:
+            return
+        st = self.state[name]
+        if st.last_applied - st.snapshot_index < self.snapshot_threshold:
+            return
+        index = st.last_applied
+        entry = st.entry_at(index)
+        previous_snapshot = st.snapshot_index
+        st.snapshot_state = [dict(applied) for applied in st.applied]
+        st.snapshot_index = index
+        st.snapshot_term = entry["term"]
+        # log[0] has global index previous_snapshot + 1, so the compacted
+        # prefix occupies the first (index - previous_snapshot) slots.
+        del st.log[: index - previous_snapshot]
+        self._record({
+            "type": "snapshotCreated",
+            "node": name,
+            "lastIncludedIndex": index,
+            "lastIncludedTerm": entry["term"],
+        })
 
     # -- timeouts, heartbeats, faults ---------------------------------------
 
@@ -889,16 +1167,30 @@ class _Simulator:
     # -- report ---------------------------------------------------------------
 
     def _log_matching_violations(self) -> list[dict]:
-        """Same index and term, but different content (id/command) across nodes."""
+        """Same index and term, but different content (id/command) across nodes.
+
+        Entries compacted into a snapshot live in that node's captured applied
+        state, so the comparison runs across the snapshot boundary as well as
+        over the uncompacted log suffix."""
         violations = []
+
+        def entry_at(st: _Node, index: int) -> dict | None:
+            if index <= st.snapshot_index:
+                if st.snapshot_state is not None and index <= len(st.snapshot_state):
+                    return st.snapshot_state[index - 1]
+                return None
+            if index <= st.last_log_index():
+                return st.entry_at(index)
+            return None
+
         max_len = max((st.last_log_index() for st in self.state.values()), default=0)
         for index in range(1, max_len + 1):
             by_term: dict[int, dict[str, dict]] = {}
             for name in self.node_names:
                 st = self.state[name]
-                if index > st.last_log_index():
+                entry = entry_at(st, index)
+                if entry is None:
                     continue
-                entry = st.log[index - 1]
                 marker = json.dumps([entry["id"], entry["command"]], ensure_ascii=False, sort_keys=True)
                 bucket = by_term.setdefault(
                     entry["term"],
@@ -1009,6 +1301,15 @@ class _Simulator:
             "lastApplied": st.last_applied,
             "applied": [dict(entry) for entry in st.applied],
         }
+        if self.snapshot_enabled:
+            report["snapshot"] = (
+                None
+                if st.snapshot_state is None
+                else {
+                    "lastIncludedIndex": st.snapshot_index,
+                    "lastIncludedTerm": st.snapshot_term,
+                }
+            )
         if self.node_events_provided:
             report["online"] = st.online
             report["restartCount"] = st.restart_count

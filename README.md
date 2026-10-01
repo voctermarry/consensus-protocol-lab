@@ -52,6 +52,7 @@ consensus-protocol-lab --help               # 打印用法
   - `time`：`[0, duration]` 内的非负整数虚拟时间。
   - `node`：已有节点名。
   - `action`：`crash` 或 `restart`。同一节点的事件必须从 `crash` 开始并严格交替。
+- `snapshotThreshold`（可选）：正整数。节点顺序应用提交项后，若 `lastApplied` 距上次快照位置达到该阈值，就在当前 `lastApplied` 处保存快照（索引、任期与已应用状态）并删除此前日志。缺省时不启用快照与日志压缩。
 
 ### 语义
 
@@ -65,7 +66,8 @@ consensus-protocol-lab --help               # 打印用法
 - 同一时刻依次处理故障、nodeEvents、消息、客户命令及其零延迟复制级联、超时、心跳；同刻事件按 `nodes` 顺序，timeline 以全局递增 `seq` 记录。
 - 节点在线时，任期、投票、日志、`commitIndex`、`lastApplied` 与 `applied` 的每次变化都在相关响应之前同步持久化（leader 接受命令前先持久化日志）；持久化不读取墙钟、不使用随机数。
 - `crash` 后节点离线：不发送或处理任何消息，不触发选举超时、心跳或客户命令；发往离线节点的消息在到达时记为 `dropped`/`nodeDown`，而崩溃前已发出的消息仍按原时间投递。发给离线节点的客户命令记为 `rejected`/`nodeDown`，`knownLeader` 为 `null`。
-- `restart` 恢复持久化状态（`term`、`votedFor`、`log`、`commitIndex`、`lastApplied`、`applied`），以 follower、`knownLeader` 为 `null` 上线，清空候选票与 leader 复制进度，选举超时从重启时刻重新计算；已恢复的条目不会重复应用。
+- `restart` 恢复持久化状态（`term`、`votedFor`、`log`、`commitIndex`、`lastApplied`、`applied`，以及快照的 `lastIncludedIndex`、`lastIncludedTerm` 与已应用状态），以 follower、`knownLeader` 为 `null` 上线，清空候选票与 leader 复制进度，选举超时从重启时刻重新计算；已恢复的条目不会重复应用。
+- 启用 `snapshotThreshold` 后，压缩只删除日志前缀，剩余日志继续使用全局索引：选举比较、前缀匹配、`commitIndex` 与 `lastApplied` 均不重新编号。leader 发现某 follower 的 `nextIndex` 已被自身快照覆盖时发送 `installSnapshot`（携带快照点的索引、任期与已应用状态），沿用现有延迟、乱序、分区和离线投递规则。follower 对旧任期消息回复 `staleTerm`；同任期消息的 `lastIncludedIndex` 不大于自身快照位置时回复 `ignored`；接受新快照时恢复状态，把 `commitIndex`、`lastApplied` 至少推进到快照点，仅当本地同索引处任期相同才保留其后缀日志（否则删除后缀），回复 `installed`，且快照内命令不会再次产生 `applied` 事件。leader 随后从快照后一项继续复制。
 
 ### 输出
 
@@ -77,7 +79,8 @@ consensus-protocol-lab --help               # 打印用法
   - `commitAdvance`：leader 推进 `commitIndex`。
   - `applied`：节点按索引应用一条已提交条目（含 `index`、`term`、`id`）。
   - `nodeLifecycle`：节点 `crash` 或 `restart`（含 `node`、`action`），仅在提供 `nodeEvents` 时出现。
-- `nodes`：各节点最终的 `role`、`term`、`votedFor`、`knownLeader`，以及 `log`（`index`/`term`/`id`/`command`）、`commitIndex`、`lastApplied`、`applied`；提供 `nodeEvents` 时另含 `online` 与 `restartCount`。
+  - 启用快照时新增 `snapshotCreated`（含 `node`、`lastIncludedIndex`、`lastIncludedTerm`）与 `snapshotInstalled`（含 `node`、`peer`、`lastIncludedIndex`、`lastIncludedTerm`）；`installSnapshot`/`snapshotReply` 的发送与 `messageResult` 沿用 `messageSend`/`messageResult` 展示，结果为 `installed`、`ignored`、`staleTerm` 或 `dropped`。
+- `nodes`：各节点最终的 `role`、`term`、`votedFor`、`knownLeader`，以及 `log`（`index`/`term`/`id`/`command`，仅未压缩后缀）、`commitIndex`、`lastApplied`、`applied`（完整且无重复的历史）；提供 `nodeEvents` 时另含 `online` 与 `restartCount`；启用快照时另含 `snapshot`（`lastIncludedIndex`、`lastIncludedTerm`，未创建时为 `null`）。
 - `clients`：按输入顺序汇总每个 `id` 的最终结局，恰为四类之一：
   - `committed`：已被某节点应用（含最终 `index`、`term`），同一 `id` 至多一次。
   - `superseded`：曾被接受但在提交前被更高任期的日志覆盖删除。
@@ -87,11 +90,11 @@ consensus-protocol-lab --help               # 打印用法
 - `logMatching`：`violations` 列出“同索引同任期但内容（id/command）不同”的情况。
 - `stateMachineSafety`：`violations` 列出不同节点在同一索引应用了不同命令的情况。
 
-未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段，既有合法场景的输出逐字节不变。
+未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段与快照相关事件，既有合法场景的输出逐字节不变。
 
 ### 错误
 
-文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
 ## 现有公开接口
 
@@ -100,5 +103,5 @@ consensus-protocol-lab --help               # 打印用法
 
 ## 限制
 
-- 实现 Raft 选主、心跳与日志复制/提交，以及节点崩溃与基于持久化状态的重启恢复；不包含集群成员变更、快照与日志压缩。
+- 实现 Raft 选主、心跳、日志复制/提交、节点崩溃与基于持久化状态的重启恢复，以及可选的快照与日志压缩；不包含集群成员变更。
 - 仿真不读取墙钟、不使用随机数；持久化为同步建模，不在磁盘上创建任何文件。
