@@ -247,6 +247,246 @@ def test_unreadable_and_invalid_plan_files(tmp_path, capsys):
     assert err.startswith("error: plan file is not valid UTF-8:")
 
 
+# -- minimizeFailures -------------------------------------------------------
+
+
+def _membership_scenario(deadline):
+    # Adding learner d commits via joint consensus around t=321 when healthy;
+    # a single fault on the learner's catch-up path pushes the stable commit
+    # to t=330, so a deadline of 325 turns exactly that singleton case red.
+    return _base_scenario(
+        nodes=["a", "b", "c", "d"],
+        duration=700,
+        electionTimeouts={"a": 80, "b": 150, "c": 200, "d": 250},
+        heartbeatInterval=50,
+        messageDelay=5,
+        initialMembers=["a", "b", "c"],
+        membershipChanges=[
+            {"time": 300, "node": "a", "id": "m1", "action": "add", "member": "d"}
+        ],
+        clientCommands=[{"time": 291, "node": "a", "id": "w1", "command": 1}],
+        livenessChecks=[
+            {"id": "M", "type": "membershipCommitted",
+             "startTime": 300, "deadline": deadline, "target": "m1"}
+        ],
+    )
+
+
+def test_minimize_failures_must_be_a_boolean(tmp_path, capsys):
+    for value in (0, 1, "true", None, [], {}):
+        plan = _base_plan(minimizeFailures=value)
+        err = _run_error(tmp_path, capsys, plan)
+        assert "minimizeFailures must be a boolean" in err
+
+
+def test_minimize_false_and_omitted_outputs_are_identical(tmp_path, capsys):
+    plan = _base_plan(candidates=[_candidate(1), _candidate(2)], maxFaults=2)
+    _, out_omitted, _ = _run(tmp_path, capsys, plan)
+    plan_false = dict(plan)
+    plan_false["minimizeFailures"] = False
+    _, out_false, _ = _run(tmp_path, capsys, plan_false)
+    assert out_false == out_omitted
+    summary = json.loads(out_omitted)
+    for case in summary["cases"]:
+        assert "failureReports" not in case
+        assert "minimalSelected" not in case
+        assert "minimalCaseId" not in case
+
+
+def test_minimize_failures_fields_on_failed_and_passed_cases(tmp_path, capsys):
+    plan = {
+        "scenario": _membership_scenario(325),
+        "candidates": [
+            {"from": "d", "to": "a", "message": "appendReply",
+             "occurrence": 1, "action": "drop"},
+        ],
+        "maxFaults": 1,
+        "maxCases": 100,
+        "minimizeFailures": True,
+    }
+    summary = _run_ok(tmp_path, capsys, plan)
+    assert summary["totalCases"] == 2
+    assert summary["failedCases"] == 1
+    plain, faulted = summary["cases"]
+    assert plain["status"] == "passed"
+    assert "failureReports" not in plain
+    assert "minimalSelected" not in plain
+    assert "minimalCaseId" not in plain
+    assert faulted["status"] == "failed"
+    assert faulted["failureReports"] == ["liveness"]
+    assert faulted["minimalSelected"] == [0]
+    assert faulted["minimalCaseId"] == faulted["caseId"] == 1
+    # The reproduction reference points at the existing case; no new cases
+    # are enumerated for minimization.
+    assert [c["caseId"] for c in summary["cases"]] == [0, 1]
+
+
+def test_minimize_selects_a_passing_base_only_when_the_signature_matches(tmp_path, capsys):
+    # The stale read is intrinsic to the crashed-leader scenario: the no-fault
+    # case fails linearizability and is the minimum of every case with that
+    # signature. The pair additionally misses the leaderElected deadline, so
+    # its signature is liveness-only and must not collapse onto the base.
+    scenario = _base_scenario(
+        duration=700,
+        clientCommands=[{"time": 140, "node": "a", "id": "w1", "command": "x"}],
+        nodeEvents=[{"time": 165, "node": "a", "action": "crash"}],
+        readQueries=[{"time": 400, "node": "b", "id": "r1"}],
+        livenessChecks=[
+            {"id": "L1", "type": "leaderElected", "startTime": 0, "deadline": 125}
+        ],
+    )
+    plan = {
+        "scenario": scenario,
+        "candidates": [
+            {"from": "b", "to": "a", "message": "voteReply",
+             "occurrence": 1, "action": "drop"},
+            {"from": "c", "to": "a", "message": "voteReply",
+             "occurrence": 1, "action": "drop"},
+        ],
+        "maxFaults": 2,
+        "maxCases": 100,
+        "minimizeFailures": True,
+    }
+    summary = _run_ok(tmp_path, capsys, plan)
+    by_id = {case["caseId"]: case for case in summary["cases"]}
+    assert by_id[0]["failureReports"] == ["linearizability"]
+    assert by_id[0]["minimalSelected"] == []
+    assert by_id[0]["minimalCaseId"] == 0
+    for case_id in (1, 2):
+        assert by_id[case_id]["failureReports"] == ["linearizability"]
+        assert by_id[case_id]["minimalSelected"] == []
+        assert by_id[case_id]["minimalCaseId"] == 0
+    pair = by_id[3]
+    assert pair["selected"] == [0, 1]
+    assert pair["failureReports"] == ["liveness"]
+    assert pair["minimalSelected"] == [0, 1]
+    assert pair["minimalCaseId"] == 3
+
+
+def test_minimize_tie_breaks_on_numeric_lexicographic_order(tmp_path, capsys):
+    # Two unrelated single faults each push the stable membership commit past
+    # the deadline; a subset reachable from the pair but carrying the other
+    # report never wins, and the lexicographically smallest minimum is [0].
+    plan = {
+        "scenario": _membership_scenario(325),
+        "candidates": [
+            {"from": "d", "to": "a", "message": "appendReply",
+             "occurrence": 1, "action": "drop"},
+            {"from": "a", "to": "d", "message": "appendEntries",
+             "occurrence": 1, "action": "drop"},
+        ],
+        "maxFaults": 2,
+        "maxCases": 100,
+        "minimizeFailures": True,
+    }
+    summary = _run_ok(tmp_path, capsys, plan)
+    by_selection = {tuple(c["selected"]): c for c in summary["cases"]}
+    assert by_selection[()]["status"] == "passed"
+    assert by_selection[(0,)]["minimalSelected"] == [0]
+    assert by_selection[(1,)]["minimalSelected"] == [1]
+    pair = by_selection[(0, 1)]
+    assert pair["failureReports"] == ["liveness"]
+    assert pair["minimalSelected"] == [0]
+    assert pair["minimalCaseId"] == by_selection[(0,)]["caseId"]
+
+
+def test_minimize_only_deletes_rules_from_the_case(tmp_path, capsys):
+    # Two candidates at different selectors each fail on their own; the
+    # singleton minimum of [1] must be [1], never the unrelated [0].
+    plan = {
+        "scenario": _membership_scenario(325),
+        "candidates": [
+            {"from": "d", "to": "a", "message": "appendReply",
+             "occurrence": 1, "action": "drop"},
+            {"from": "a", "to": "d", "message": "appendEntries",
+             "occurrence": 1, "action": "drop"},
+        ],
+        "maxFaults": 2,
+        "maxCases": 100,
+        "minimizeFailures": True,
+    }
+    summary = _run_ok(tmp_path, capsys, plan)
+    by_selection = {tuple(c["selected"]): c for c in summary["cases"]}
+    assert set(by_selection[(1,)]["minimalSelected"]).issubset({1})
+    assert by_selection[(1,)]["minimalSelected"] == [1]
+
+
+def test_minimize_references_do_not_count_against_max_cases(tmp_path, capsys):
+    # Four combinations exactly hit maxCases; the extra minimization
+    # bookkeeping must not inflate the combination count.
+    plan = {
+        "scenario": _membership_scenario(325),
+        "candidates": [
+            {"from": "d", "to": "a", "message": "appendReply",
+             "occurrence": 1, "action": "drop"},
+        ],
+        "maxFaults": 1,
+        "maxCases": 2,
+        "minimizeFailures": True,
+    }
+    summary = _run_ok(tmp_path, capsys, plan)
+    assert summary["totalCases"] == 2
+    assert summary["failedCases"] == 1
+
+
+def test_minimize_failure_reports_follow_check_priority(tmp_path, capsys):
+    # The baseline both serves a stale read and misses a deadline; an enabled
+    # report with no violations (electionSafety) stays out of the list, and
+    # the present names follow the documented check priority.
+    scenario = _base_scenario(
+        duration=700,
+        clientCommands=[{"time": 140, "node": "a", "id": "w1", "command": "x"}],
+        nodeEvents=[{"time": 165, "node": "a", "action": "crash"}],
+        readQueries=[{"time": 400, "node": "b", "id": "r1"}],
+        livenessChecks=[
+            {"id": "L1", "type": "leaderElected", "startTime": 0, "deadline": 50}
+        ],
+    )
+    plan = {
+        "scenario": scenario,
+        "candidates": [_candidate(91)],
+        "maxFaults": 1,
+        "maxCases": 100,
+        "minimizeFailures": True,
+    }
+    summary = _run_ok(tmp_path, capsys, plan)
+    assert all(
+        case["failureReports"] == ["linearizability", "liveness"]
+        for case in summary["cases"]
+    )
+    assert all(case["minimalSelected"] == [] for case in summary["cases"])
+
+
+def test_minimize_does_not_change_enumeration_or_summary(tmp_path, capsys):
+    # Same plan with and without minimization: scope, caseId, selected,
+    # status, result and the counters are byte-identical apart from the three
+    # added fields on failed cases.
+    def strip(cases):
+        return [
+            {k: v for k, v in case.items()
+             if k not in ("failureReports", "minimalSelected", "minimalCaseId")}
+            for case in cases
+        ]
+
+    plan = {
+        "scenario": _membership_scenario(325),
+        "candidates": [
+            {"from": "d", "to": "a", "message": "appendReply",
+             "occurrence": 1, "action": "drop"},
+        ],
+        "maxFaults": 1,
+        "maxCases": 100,
+    }
+    _, out_plain, _ = _run(tmp_path, capsys, plan)
+    minimized = dict(plan)
+    minimized["minimizeFailures"] = True
+    summary_min = _run_ok(tmp_path, capsys, minimized)
+    summary_plain = json.loads(out_plain)
+    for key in ("totalCases", "passedCases", "failedCases"):
+        assert summary_min[key] == summary_plain[key]
+    assert strip(summary_min["cases"]) == strip(summary_plain["cases"])
+
+
 def test_simulate_and_version_are_unchanged(tmp_path, capsys):
     path = tmp_path / "scenario.json"
     path.write_text(json.dumps(_base_scenario()), encoding="utf-8")

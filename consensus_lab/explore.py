@@ -12,7 +12,8 @@ from itertools import combinations
 
 from .simulate import ScenarioError, _Simulator, _require_int, parse_scenario
 
-_PLAN_FIELDS = {"scenario", "candidates", "maxFaults", "maxCases"}
+_PLAN_FIELDS = {"scenario", "candidates", "maxFaults", "maxCases", "minimizeFailures"}
+_REQUIRED_PLAN_FIELDS = {"scenario", "candidates", "maxFaults", "maxCases"}
 
 # Reports whose violation lists decide a case's status. A report the scenario
 # does not enable is absent from the result and plays no part in the verdict.
@@ -25,6 +26,17 @@ _CHECKED_REPORTS = (
 )
 
 
+def _failure_signature(result: dict) -> tuple[str, ...]:
+    """Names of the enabled reports whose violation list is non-empty, in
+    fixed check-priority order. Two cases share a failure signature exactly
+    when they violate the same set of invariants."""
+    return tuple(
+        key
+        for key in _CHECKED_REPORTS
+        if key in result and result[key]["violations"]
+    )
+
+
 def run_explore(raw: object) -> dict:
     """Validate a decoded JSON PLAN and run every fault combination."""
     if not isinstance(raw, dict):
@@ -32,9 +44,13 @@ def run_explore(raw: object) -> dict:
     unknown = sorted(set(raw) - _PLAN_FIELDS)
     if unknown:
         raise ScenarioError(f"unknown field(s): {', '.join(unknown)}")
-    missing = sorted(_PLAN_FIELDS - set(raw))
+    missing = sorted(_REQUIRED_PLAN_FIELDS - set(raw))
     if missing:
         raise ScenarioError(f"missing field(s): {', '.join(missing)}")
+
+    minimize_failures = raw.get("minimizeFailures", False)
+    if not isinstance(minimize_failures, bool):
+        raise ScenarioError("minimizeFailures must be a boolean")
 
     scenario_raw = raw["scenario"]
     if not isinstance(scenario_raw, dict):
@@ -73,6 +89,11 @@ def run_explore(raw: object) -> dict:
     # order, and each tuple is ascending, so selected rules are always
     # injected in original candidate-index order.
     cases = []
+    # Only populated while minimizing: signature -> list of
+    # (selected index tuple, caseId). Minimization never runs extra
+    # simulations; it only references cases enumerated here, so those
+    # references do not count against maxCases.
+    by_signature: dict[tuple[str, ...], list[tuple[tuple[int, ...], int]]] = {}
     passed = 0
     case_id = 0
     for size in range(max_faults + 1):
@@ -80,24 +101,48 @@ def run_explore(raw: object) -> dict:
             case_config = dict(config)
             case_config["messageFaults"] = [rules[i] for i in selected]
             result = _Simulator(case_config).run()
-            failed = any(
-                key in result and result[key]["violations"]
-                for key in _CHECKED_REPORTS
-            )
-            if failed:
+            signature = _failure_signature(result)
+            if signature:
                 status = "failed"
             else:
                 status = "passed"
                 passed += 1
-            cases.append(
-                {
-                    "caseId": case_id,
-                    "selected": list(selected),
-                    "status": status,
-                    "result": result,
-                }
-            )
+            case = {
+                "caseId": case_id,
+                "selected": list(selected),
+                "status": status,
+                "result": result,
+            }
+            if minimize_failures and signature:
+                by_signature.setdefault(signature, []).append((selected, case_id))
+            cases.append(case)
             case_id += 1
+
+    if minimize_failures:
+        for case in cases:
+            if case["status"] != "failed":
+                continue
+            signature = _failure_signature(case["result"])
+            selected = tuple(case["selected"])
+            # Every minimizing combination must be reachable by deleting
+            # rules from this case (a sub-combination of its selected
+            # indices) and reproduce its exact failure signature: a
+            # combination that passes or that only shows other violations
+            # is never selected. Fewer rules win; ties are broken by the
+            # numeric lexicographic order of the index array. The case
+            # itself always qualifies.
+            minimal_selected, minimal_case_id = min(
+                (
+                    entry
+                    for entry in by_signature[signature]
+                    if set(entry[0]).issubset(selected)
+                ),
+                key=lambda entry: (len(entry[0]), entry[0]),
+            )
+            case["failureReports"] = list(signature)
+            case["minimalSelected"] = list(minimal_selected)
+            case["minimalCaseId"] = minimal_case_id
+
     return {
         "totalCases": len(cases),
         "passedCases": passed,
