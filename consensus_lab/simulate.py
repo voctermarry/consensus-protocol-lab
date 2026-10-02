@@ -26,8 +26,15 @@ _KIND_REACTION = 4
 # (t, REACTION, ...) entries ahead of (t, MEMBERSHIP, ...), so a request's own
 # zero-delay cascade likewise drains before the next timed event.
 _KIND_MEMBERSHIP = 5
-_KIND_TIMEOUT = 6
-_KIND_HEARTBEAT = 7
+# Read queries are admitted at a timestamp after the client-command and
+# membership zero-delay cascades have drained, but before timeouts/heartbeats;
+# their own probes/replies drain in a dedicated phase so that every read
+# sharing a timestamp is admitted in input order before any reaction, exactly
+# like client commands and their reactions.
+_KIND_READ = 6
+_KIND_READ_REACTION = 7
+_KIND_TIMEOUT = 8
+_KIND_HEARTBEAT = 9
 
 _TOP_LEVEL_FIELDS = {
     "nodes",
@@ -42,6 +49,7 @@ _TOP_LEVEL_FIELDS = {
     "initialMembers",
     "membershipChanges",
     "messageFaults",
+    "readQueries",
 }
 _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "faults",
@@ -51,6 +59,7 @@ _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "initialMembers",
     "membershipChanges",
     "messageFaults",
+    "readQueries",
 }
 _FAULT_FIELDS = {"time", "action", "groups"}
 _MESSAGE_FAULT_FIELDS = {"from", "to", "message", "occurrence", "action", "delay"}
@@ -63,10 +72,13 @@ _MESSAGE_KINDS = (
     "appendReply",
     "installSnapshot",
     "installSnapshotReply",
+    "readProbe",
+    "readReply",
 )
 _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 _NODE_EVENT_FIELDS = {"time", "node", "action"}
 _MEMBERSHIP_CHANGE_FIELDS = {"time", "node", "id", "action", "member"}
+_READ_QUERY_FIELDS = {"time", "node", "id"}
 
 # Log-entry kinds: ordinary client commands versus replicated configuration
 # entries created by joint-consensus membership changes.
@@ -380,11 +392,12 @@ def parse_scenario(raw: object) -> dict:
                 raise ScenarioError(
                     f"{label}.id duplicates a previous id: {change_id!r}"
                 )
-            seen_change_ids.add(change_id)
             if change_id in seen_ids:
                 raise ScenarioError(
                     f"{label}.id duplicates a clientCommands id: {change_id!r}"
                 )
+            seen_change_ids.add(change_id)
+            seen_ids.add(change_id)
             action = change["action"]
             if action not in ("add", "remove"):
                 raise ScenarioError(f"{label}.action must be add or remove")
@@ -405,6 +418,42 @@ def parse_scenario(raw: object) -> dict:
                 }
             )
 
+    read_queries_provided = "readQueries" in raw
+    read_queries = raw.get("readQueries", [])
+    if not isinstance(read_queries, list):
+        raise ScenarioError("readQueries must be a list")
+    normalized_reads = []
+    seen_read_ids: set[str] = set()
+    for index, query in enumerate(read_queries):
+        label = f"readQueries[{index}]"
+        if not isinstance(query, dict):
+            raise ScenarioError(f"{label} must be an object")
+        unknown = sorted(set(query) - _READ_QUERY_FIELDS)
+        if unknown:
+            raise ScenarioError(f"{label} has unknown field(s): {', '.join(unknown)}")
+        missing = sorted(_READ_QUERY_FIELDS - set(query))
+        if missing:
+            raise ScenarioError(f"{label} missing field(s): {', '.join(missing)}")
+        time = _require_int(query["time"], f"{label}.time", 0)
+        if time > duration:
+            raise ScenarioError(f"{label}.time is beyond the simulation duration")
+        node = query["node"]
+        if not isinstance(node, str) or not node:
+            raise ScenarioError(f"{label}.node must be a non-empty string")
+        if node not in node_set:
+            raise ScenarioError(f"{label}.node references unknown node: {node!r}")
+        query_id = query["id"]
+        if not isinstance(query_id, str) or not query_id:
+            raise ScenarioError(f"{label}.id must be a non-empty string")
+        if query_id in seen_read_ids:
+            raise ScenarioError(f"{label}.id duplicates a previous id: {query_id!r}")
+        if query_id in seen_ids:
+            raise ScenarioError(
+                f"{label}.id duplicates a clientCommands or membershipChanges id: {query_id!r}"
+            )
+        seen_read_ids.add(query_id)
+        normalized_reads.append({"time": time, "node": node, "id": query_id})
+
     return {
         "nodes": list(nodes),
         "duration": duration,
@@ -420,6 +469,8 @@ def parse_scenario(raw: object) -> dict:
         "membershipEnabled": membership_enabled,
         "initialMembers": initial_members,
         "membershipChanges": normalized_changes if has_initial_members else None,
+        "readQueries": normalized_reads,
+        "readQueriesProvided": read_queries_provided,
     }
 
 
@@ -549,6 +600,8 @@ class _Simulator:
         self.commands: list[dict] = config["clientCommands"]
         self.node_events: list[dict] = config["nodeEvents"]
         self.node_events_provided: bool = config["nodeEventsProvided"]
+        self.reads: list[dict] = config["readQueries"]
+        self.reads_provided: bool = config["readQueriesProvided"]
         self.snapshot_threshold: int | None = config["snapshotThreshold"]
         self.membership_enabled: bool = config["membershipEnabled"]
         self.changes: list[dict] = config["membershipChanges"] or []
@@ -570,10 +623,11 @@ class _Simulator:
         self.queue: list[tuple] = []
         self.send_counter = 0
         self.now = 0
-        # While draining client commands (and the replication cascade they
-        # trigger), new messages land in the REACTION phase instead of the
-        # regular MESSAGE phase.
-        self.reaction_phase = False
+        # While draining a client-command, membership or read-query batch,
+        # new zero-delay messages land in that batch's own reaction phase so
+        # that, even with zero message delay, all entries sharing a timestamp
+        # are handled in input order before their reactions drain.
+        self.reaction_kind: int | None = None
         # Commands rejected at the door (target was not leader, or was down)
         # never reach a log. Final committed / superseded / pending outcomes
         # are derived from the end state; reason and knownLeader are captured
@@ -589,6 +643,14 @@ class _Simulator:
         # learner's matchIndex reaches the pre-joint log end, the leader
         # appends the joint config entry.
         self.pending_catchup: dict | None = None
+        # Read queries: accepted probes awaiting a same-term effective-config
+        # majority of read replies. Keyed by query id.
+        # entry: {"node", "term", "config", "acks": set[str]}
+        self.pending_reads: dict[str, dict] = {}
+        # Final outcome of every admitted query, keyed by id, in case the
+        # finalization time differs from admission time.
+        # entry: {"result", "term"?, "readIndex"?, "state"?, "reason"?}
+        self.read_results: dict[str, dict] = {}
 
     def run(self) -> dict:
         for order, fault in enumerate(self.faults):
@@ -599,6 +661,8 @@ class _Simulator:
             heapq.heappush(self.queue, (command["time"], _KIND_CLIENT, order, command))
         for order, change in enumerate(self.changes):
             heapq.heappush(self.queue, (change["time"], _KIND_MEMBERSHIP, order, change))
+        for order, query in enumerate(self.reads):
+            heapq.heappush(self.queue, (query["time"], _KIND_READ, order, query))
         for name in self.node_names:
             if self._is_voter(name, self.initial_config):
                 heapq.heappush(self.queue, (self.timeouts[name], _KIND_TIMEOUT, self.index[name], (name, 0)))
@@ -607,21 +671,33 @@ class _Simulator:
             if time > self.duration:
                 break
             self.now = time
-            self.reaction_phase = kind in (_KIND_CLIENT, _KIND_MEMBERSHIP, _KIND_REACTION)
+            if kind in (_KIND_CLIENT, _KIND_MEMBERSHIP, _KIND_REACTION):
+                self.reaction_kind = _KIND_REACTION
+            elif kind in (_KIND_READ, _KIND_READ_REACTION):
+                self.reaction_kind = _KIND_READ_REACTION
+            else:
+                self.reaction_kind = None
             if kind == _KIND_FAULT:
                 self._apply_fault(payload)
             elif kind == _KIND_NODE_EVENT:
                 self._on_node_event(payload)
-            elif kind in (_KIND_MESSAGE, _KIND_REACTION):
+            elif kind in (
+                _KIND_MESSAGE,
+                _KIND_REACTION,
+                _KIND_READ_REACTION,
+            ):
                 self._deliver(payload)
             elif kind == _KIND_CLIENT:
                 self._on_client_command(payload)
             elif kind == _KIND_MEMBERSHIP:
                 self._on_membership_change(payload)
+            elif kind == _KIND_READ:
+                self._on_read_query(payload)
             elif kind == _KIND_TIMEOUT:
                 self._on_timeout(*payload)
             else:
                 self._on_heartbeat(*payload)
+        self._finalize_reads()
         return self._report()
 
     # -- timeline helpers -------------------------------------------------
@@ -746,6 +822,7 @@ class _Simulator:
 
     def _become_follower(self, name: str, term: int, reason: str) -> None:
         st = self.state[name]
+        was_leader = st.role == ROLE_LEADER
         st.role = ROLE_FOLLOWER
         st.term = term
         st.voted_for = None
@@ -753,6 +830,8 @@ class _Simulator:
         st.votes = set()
         st.next_index = {}
         st.match_index = {}
+        if was_leader:
+            self._abort_leader_reads(name)
         self._reset_timeout(name)
         self._record_state_change(name, reason)
 
@@ -850,7 +929,16 @@ class _Simulator:
     # -- messages -----------------------------------------------------------
 
     def _send(self, src: str, dst: str, msg: dict) -> None:
-        self._record({"type": "messageSend", "node": src, "peer": dst, "message": msg["kind"], "term": msg["term"]})
+        send_entry = {
+            "type": "messageSend",
+            "node": src,
+            "peer": dst,
+            "message": msg["kind"],
+            "term": msg["term"],
+        }
+        if "readId" in msg:
+            send_entry["readId"] = msg["readId"]
+        self._record(send_entry)
         self.send_counter += 1
         envelope = {**msg, "src": src, "dst": dst}
         # A messageFaults rule matches the occurrence-th actual send of its
@@ -881,12 +969,12 @@ class _Simulator:
                 fault_entry["arrivalTime"] = scheduled + extra_delay
             self._record(fault_entry)
         effective_delay = self.delay + extra_delay
-        # Zero-delay replication triggered while draining a client-command
-        # batch shares the batch's timestamp and must follow the remaining
-        # client commands; a positive delay lands strictly in the future and
-        # queues as a normal message arrival.
-        in_phase = self.reaction_phase and effective_delay == 0
-        kind = _KIND_REACTION if in_phase else _KIND_MESSAGE
+        # Zero-delay traffic triggered while draining a batch shares the
+        # batch's timestamp and must follow the remaining entries of that
+        # batch; a positive delay lands strictly in the future and queues as a
+        # normal message arrival.
+        in_phase = self.reaction_kind is not None and effective_delay == 0
+        kind = self.reaction_kind if in_phase else _KIND_MESSAGE
         heapq.heappush(self.queue, (self.now + effective_delay, kind, self.send_counter, envelope))
 
     def _send_heartbeats(self, name: str) -> None:
@@ -954,45 +1042,35 @@ class _Simulator:
             return True
         return any(a in group and b in group for group in self.partition)
 
+    def _drop_record(self, msg: dict, reason: str) -> dict:
+        entry = {
+            "type": "messageResult",
+            "node": msg["dst"],
+            "peer": msg["src"],
+            "message": msg["kind"],
+            "term": msg["term"],
+            "result": "dropped",
+            "reason": reason,
+        }
+        if "readId" in msg:
+            entry["readId"] = msg["readId"]
+        return entry
+
     def _deliver(self, msg: dict) -> None:
         src, dst = msg["src"], msg["dst"]
         if msg.get("faultDrop"):
             # A messageFaults drop rule: the message never reaches the
             # receiver, reported at its originally scheduled arrival time.
-            self._record({
-                "type": "messageResult",
-                "node": dst,
-                "peer": src,
-                "message": msg["kind"],
-                "term": msg["term"],
-                "result": "dropped",
-                "reason": "messageFault",
-            })
+            self._record(self._drop_record(msg, "messageFault"))
             return
         if not self.state[dst].online:
             # The destination crashed after this message was sent; it is
             # dropped on arrival. Messages the crashed node itself sent
             # earlier are unaffected and still land at their original time.
-            self._record({
-                "type": "messageResult",
-                "node": dst,
-                "peer": src,
-                "message": msg["kind"],
-                "term": msg["term"],
-                "result": "dropped",
-                "reason": "nodeDown",
-            })
+            self._record(self._drop_record(msg, "nodeDown"))
             return
         if not self._connected(src, dst):
-            self._record({
-                "type": "messageResult",
-                "node": dst,
-                "peer": src,
-                "message": msg["kind"],
-                "term": msg["term"],
-                "result": "dropped",
-                "reason": "partition",
-            })
+            self._record(self._drop_record(msg, "partition"))
             return
         kind = msg["kind"]
         if kind == "requestVote":
@@ -1007,6 +1085,10 @@ class _Simulator:
             self._handle_install_snapshot(msg)
         elif kind == "installSnapshotReply":
             self._handle_snapshot_reply(msg)
+        elif kind == "readProbe":
+            self._handle_read_probe(msg)
+        elif kind == "readReply":
+            self._handle_read_reply(msg)
         else:
             self._handle_append_reply(msg)
 
@@ -1588,6 +1670,215 @@ class _Simulator:
             if peer != node:
                 self._replicate_to(node, peer)
 
+    # -- read queries -------------------------------------------------------
+
+    # Outcome fields carried only in self.read_results, never emitted.
+    _READ_INTERNAL_FIELDS = ("node", "commitAtAdmission")
+
+    def _finish_read(self, query_id: str, node: str, outcome: dict) -> None:
+        self.read_results[query_id] = {"node": node, **outcome}
+        event = {"type": "readResult", "node": node, "id": query_id}
+        for key, value in outcome.items():
+            if key not in self._READ_INTERNAL_FIELDS:
+                event[key] = value
+        self._record(event)
+
+    def _abort_leader_reads(self, leader: str) -> None:
+        """Every probe round the deposed leader still has open loses its
+        identity: same-term replies can no longer complete those reads."""
+        lost = [
+            query_id
+            for query_id, pending in self.pending_reads.items()
+            if pending["node"] == leader
+        ]
+        for query_id in lost:
+            self.pending_reads.pop(query_id)
+            self._finish_read(
+                query_id, leader, {"result": "rejected", "reason": "leadershipLost"}
+            )
+
+    def _on_read_query(self, query: dict) -> None:
+        node = query["node"]
+        query_id = query["id"]
+        st = self.state[node]
+        if not st.online:
+            self._finish_read(
+                query_id,
+                node,
+                {"result": "rejected", "reason": "nodeDown", "knownLeader": None},
+            )
+            return
+        if st.role != ROLE_LEADER:
+            self._finish_read(
+                query_id,
+                node,
+                {
+                    "result": "rejected",
+                    "reason": "notLeader",
+                    "knownLeader": st.known_leader,
+                },
+            )
+            return
+
+        # The round is bound to the leader identity (node, term) and the
+        # configuration governing it: a stable config needs a strict majority
+        # of its voters, a joint config needs strict majorities of both voter
+        # sets, learners are never probed.
+        config = st.latest_config(self.initial_config)
+        self.pending_reads[query_id] = {
+            "node": node,
+            "term": st.term,
+            "config": config,
+            "acks": {node},
+            "commitAtAdmission": st.commit_index,
+        }
+        self._record({
+            "type": "readResult",
+            "node": node,
+            "id": query_id,
+            "result": "accepted",
+            "term": st.term,
+        })
+        for peer in self.node_names:
+            if peer != node and self._is_voter(peer, config):
+                self._send(
+                    node,
+                    peer,
+                    {"kind": "readProbe", "term": st.term, "readId": query_id},
+                )
+        self._check_read_completion(node, query_id)
+
+    def _read_has_majorities(self, pending: dict) -> bool:
+        for group in self._config_quorums(pending["config"]):
+            needed = len(group) // 2 + 1
+            if len([name for name in pending["acks"] if name in group]) < needed:
+                return False
+        return True
+
+    def _check_read_completion(self, leader: str, query_id: str) -> None:
+        pending = self.pending_reads.get(query_id)
+        if pending is None or pending["node"] != leader:
+            return
+        st = self.state[leader]
+        if st.role != ROLE_LEADER or st.term != pending["term"]:
+            return
+        if not self._read_has_majorities(pending):
+            return
+        self.pending_reads.pop(query_id)
+        read_index = st.last_applied
+        self._finish_read(
+            query_id,
+            leader,
+            {
+                "result": "completed",
+                "term": pending["term"],
+                "readIndex": read_index,
+                "state": self._read_state(leader, read_index),
+                "commitAtAdmission": pending["commitAtAdmission"],
+            },
+        )
+
+    def _read_state(self, leader: str, read_index: int) -> list[dict]:
+        """Client commands applied on the leader through read_index, in index
+        order; configuration entries are skipped and snapshot-compacted
+        commands are returned from the retained applied history."""
+        st = self.state[leader]
+        state = []
+        for entry in st.applied:
+            if entry["index"] > read_index:
+                break
+            if entry.get("kind") == KIND_CONFIG:
+                continue
+            state.append(
+                {
+                    "index": entry["index"],
+                    "term": entry["term"],
+                    "id": entry["id"],
+                    "command": entry["command"],
+                }
+            )
+        return state
+
+    def _handle_read_probe(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        if msg["term"] < st.term:
+            detail = "staleTerm"
+        else:
+            # A current-or-newer term makes a candidate or stale leader stand
+            # down exactly like a heartbeat does.
+            if msg["term"] > st.term or st.role != ROLE_FOLLOWER:
+                self._become_follower(dst, msg["term"], "readProbe")
+            else:
+                self._reset_timeout(dst)
+            st.known_leader = src
+            detail = "accepted"
+        entry = {
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "readProbe",
+            "term": msg["term"],
+            "result": "delivered",
+            "detail": detail,
+            "readId": msg["readId"],
+        }
+        self._record(entry)
+        # The reply always carries the receiver's term: a higher one lets the
+        # sender discover it and lose leadership; a stale reply is ignored.
+        self._send(
+            dst,
+            src,
+            {"kind": "readReply", "term": st.term, "readId": msg["readId"]},
+        )
+
+    def _handle_read_reply(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        query_id = msg["readId"]
+        pending = self.pending_reads.get(query_id)
+        if msg["term"] > st.term:
+            detail = "higherTerm"
+        elif (
+            st.role != ROLE_LEADER
+            or msg["term"] != st.term
+            or pending is None
+            or pending["node"] != dst
+        ):
+            # Replies from another term or another round never confirm the
+            # pending read.
+            detail = "ignored"
+        else:
+            detail = "acknowledged"
+            pending["acks"].add(src)
+        self._record({
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "readReply",
+            "term": msg["term"],
+            "result": "delivered",
+            "detail": detail,
+            "readId": query_id,
+        })
+        if msg["term"] > st.term:
+            self._become_follower(dst, msg["term"], "higherTermMessage")
+            return
+        if detail == "acknowledged":
+            self._check_read_completion(dst, query_id)
+
+    def _finalize_reads(self) -> None:
+        """Reads still open when the simulation ends have no same-term
+        effective-config majority and remain pending."""
+        self.now = self.duration
+        for query in self.reads:
+            query_id = query["id"]
+            if query_id in self.read_results:
+                continue
+            pending = self.pending_reads.pop(query_id, None)
+            node = pending["node"] if pending is not None else query["node"]
+            self._finish_read(query_id, node, {"result": "pending"})
+
     # -- membership changes --------------------------------------------------
 
     def _change_in_progress(self, st: _Node, leader: str) -> bool:
@@ -1896,6 +2187,7 @@ class _Simulator:
         st.votes = set()
         st.next_index = {}
         st.match_index = {}
+        self._abort_leader_reads(name)
         # _reset_timeout cancels the timer for a now non-voting node.
         self._reset_timeout(name)
         self._record_state_change(name, "removedFromCluster")
@@ -1952,6 +2244,8 @@ class _Simulator:
             # fires no timeouts or heartbeats until it restarts. Persisted
             # state (term, voted_for, log, commit_index, last_applied,
             # applied) is kept as-is.
+            if st.role == ROLE_LEADER:
+                self._abort_leader_reads(name)
             st.online = False
             st.timeout_gen += 1  # invalidate any pending election timeout
             self._record({"type": "nodeLifecycle", "node": name, "action": "crash"})
@@ -2181,6 +2475,53 @@ class _Simulator:
             report["restartCount"] = st.restart_count
         return report
 
+    def _reads_report(self) -> list[dict]:
+        rows = []
+        for query in self.reads:
+            outcome = self.read_results[query["id"]]
+            row = {"id": query["id"], "node": query["node"]}
+            row.update({
+                key: value
+                for key, value in outcome.items()
+                if key not in self._READ_INTERNAL_FIELDS
+            })
+            rows.append(row)
+        return rows
+
+    def _linearizability_report(self) -> dict:
+        """Validate every completed read. Two failure shapes:
+
+        - nonPrefix: the returned state is not exactly the client-command
+          prefix applied on the leader through readIndex (config entries
+          excluded, snapshot-compacted commands included).
+        - staleRead: readIndex precedes a commit the leader had already
+          advanced to before the query was admitted, so a committed write is
+          missing from the answer.
+        """
+        violations = []
+        for query in self.reads:
+            outcome = self.read_results[query["id"]]
+            if outcome.get("result") != "completed":
+                continue
+            query_id = query["id"]
+            read_index = outcome["readIndex"]
+            expected = self._read_state(outcome["node"], read_index)
+            if outcome["state"] != expected:
+                violations.append(
+                    {"id": query_id, "type": "nonPrefix", "readIndex": read_index}
+                )
+            committed_at_admission = outcome.get("commitAtAdmission", 0)
+            if read_index < committed_at_admission:
+                violations.append(
+                    {
+                        "id": query_id,
+                        "type": "staleRead",
+                        "readIndex": read_index,
+                        "committedIndex": committed_at_admission,
+                    }
+                )
+        return {"violations": violations}
+
     def _membership_report(self) -> dict:
         # The reference node deterministically has the greatest committed
         # position, then the greatest log length (declared node order breaks
@@ -2306,6 +2647,9 @@ class _Simulator:
             "logMatching": {"violations": self._log_matching_violations()},
             "stateMachineSafety": {"violations": self._state_machine_safety_violations()},
         }
+        if self.reads_provided:
+            report["reads"] = self._reads_report()
+            report["linearizability"] = self._linearizability_report()
         if self.membership_enabled:
             report["membership"] = self._membership_report()
         return report
