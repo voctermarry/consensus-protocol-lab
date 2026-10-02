@@ -2,7 +2,7 @@
 
 本项目是「分布式共识协议实验平台」的代码仓库，用于逐步实现该方向的共识流程仿真、故障注入与不变量校验能力。
 
-当前已实现确定性的 Raft 选主与日志复制仿真（含快照与日志压缩）：只推进虚拟时间，不读取墙钟、不使用随机数，同一输入产生逐字节一致的输出。
+当前已实现确定性的 Raft 选主与日志复制仿真（含快照与日志压缩、联合共识成员变更）：只推进虚拟时间，不读取墙钟、不使用随机数，同一输入产生逐字节一致的输出。
 
 ## 环境与安装
 
@@ -53,6 +53,10 @@ consensus-protocol-lab --help               # 打印用法
   - `node`：已有节点名。
   - `action`：`crash` 或 `restart`。同一节点的事件必须从 `crash` 开始并严格交替。
 - `snapshotThreshold`（可选）：正整数。节点顺序应用提交项后，若 `lastApplied` 距上次快照位置达到该阈值，就在 `lastApplied` 处保存快照（索引、任期与已应用状态）并删除此前日志。未提供时不启用快照，输出逐字节不变。
+- `initialMembers`（可选，必须与 `membershipChanges` 同时提供或同时省略）：初始投票集合，是 `nodes` 的一个至少含三个不重复名称的子集；其余节点为 learner，不参选也不投票。
+- `membershipChanges`（可选，与 `initialMembers` 成对出现）：成员变更请求列表，按输入顺序提供 `time`、`node`、`id`、`action` 与 `member`：
+  - `time`：`[0, duration]` 内的非负整数虚拟时间；`node`：接收请求的已有节点名；`id`：全局唯一的非空字符串（不得与客户命令 id 重复）；`member`：目标节点名；`action`：`add` 或 `remove`。
+  - 两字段均省略时，不产生任何成员变更相关事件、汇总或节点字段，既有合法场景输出逐字节不变。
 
 ### 语义
 
@@ -69,6 +73,14 @@ consensus-protocol-lab --help               # 打印用法
 - `restart` 恢复持久化状态（`term`、`votedFor`、`log`、快照、`commitIndex`、`lastApplied`、`applied`），以 follower、`knownLeader` 为 `null` 上线，清空候选票与 leader 复制进度，选举超时从重启时刻重新计算；已恢复的条目不会重复应用。
 - 启用 `snapshotThreshold` 后：剩余日志继续使用全局索引，选举比较、前缀匹配、`commitIndex` 与 `lastApplied` 均不重新编号；快照与剩余日志一并持久化，重启后恢复，快照内命令不会再次产生 `applied` 事件。
 - leader 发现 follower 的 `nextIndex` 已被自身快照覆盖时发送 `installSnapshot`（携带 `lastIncludedIndex`、`lastIncludedTerm` 与快照内已应用状态），沿用现有延迟、乱序、分区与离线规则。follower 对旧任期消息返回 `staleTerm`；同任期且 `lastIncludedIndex` 不大于本地快照位置时返回 `ignored`；接受新快照时恢复状态，将 `commitIndex` 与 `lastApplied` 至少推进到该位置，仅当本地同索引条目任期相同才保留其后的日志，否则删除后缀，返回 `installed`。leader 收到 `installed` 后从快照后一项继续复制。更高任期仍使接收方转为 follower，同刻处理顺序、全局 `seq` 与确定性输出保持不变。
+- 启用联合共识成员变更后：
+  - learner 复制日志但不计入任何多数，也不发起或获得选票；其选举定时器不启动。
+  - 请求按以下顺序判定并给出对应结果：接收节点离线→`nodeDown`；不是 leader→`notLeader`；已有变更进行中→`changeInProgress`；成员状态不适用→`alreadyMember`（add 已在稳定集合中）或 `notMember`（remove 不在稳定集合中）；移除后投票成员少于三个→`minimumClusterSize`。
+  - `add` 先让 learner 通过日志复制或 `installSnapshot` 追平 leader 日志末端，然后才追加联合配置项；`remove` 直接追加联合配置项。
+  - 联合配置项一经追加即生效：联合阶段的选举、日志提交与只读多数都必须同时满足新旧两个集合各自的严格多数。联合配置提交后 leader 立即追加稳定配置项；稳定配置提交后该变更才结束（结局 `committed`）。
+  - 稳定配置提交时，被移除的原 leader 立即成为 follower（原因 `removedFromCluster`），此后既不参选也不投票；该节点仅在之后又被 add 的配置追加后才恢复资格。
+  - 上一任 leader 在追加联合项前下线时，追赶状态随之下线，未追加的变更保持未完成；联合项已提交但稳定项未追加时，新当选 leader（含通过快照持有该联合项者）会补追加稳定项，变更不会丢失。
+  - 配置项、联合阶段与 learner 进度随日志与快照持久化；崩溃重启后由日志与快照恢复，已提交成员关系不会重复应用或丢失。
 
 ### 输出
 
@@ -83,21 +95,27 @@ consensus-protocol-lab --help               # 打印用法
   - `snapshotInstalled`：follower 接受 `installSnapshot`（含 `node`、`peer`、`lastIncludedIndex`、`lastIncludedTerm`），仅在提供 `snapshotThreshold` 时出现。
   - 快照消息 `installSnapshot`/`installSnapshotReply` 的发送与 `messageResult`（`installed`、`ignored`、`staleTerm`、`higherTerm`，跨分区或离线投递为 `dropped`）。
   - `nodeLifecycle`：节点 `crash` 或 `restart`（含 `node`、`action`），仅在提供 `nodeEvents` 时出现。
-- `nodes`：各节点最终的 `role`、`term`、`votedFor`、`knownLeader`，以及 `log`（仅含未压缩后缀，仍带全局 `index`/`term`/`id`/`command`）、`commitIndex`、`lastApplied`、`applied`；提供 `snapshotThreshold` 时另含 `snapshot`（`{"lastIncludedIndex", "lastIncludedTerm"}`，未创建快照时为 `null`）；提供 `nodeEvents` 时另含 `online` 与 `restartCount`。
+  - `membershipResult`：成员变更请求结果。`accepted`（add 且尚未追加联合项时含 `phase: "catchingUp"`）或 `rejected`（含 `reason`，取值 `nodeDown`/`notLeader`/`changeInProgress`/`alreadyMember`/`notMember`/`minimumClusterSize`），仅在提供成员变更字段时出现。
+  - `configurationApplied`：节点按索引应用一个已提交配置项（含 `index`、`term`、`id`、`entryType` 为 `joint`/`stable`、`config`、`action`、`member`），仅在提供成员变更字段时出现。
+  - 复制配置项的 `appendEntries` 消息结果另含 `configEntries`（每项含 `index`、`id`、`entryType`），与客户命令复制明确区分。
+- `nodes`：各节点最终的 `role`、`term`、`votedFor`、`knownLeader`，以及 `log`（仅含未压缩后缀，仍带全局 `index`/`term`/`id`/`command`；启用成员变更时客户命令条目含 `kind: "command"`，配置项含 `kind: "config"`、`entryType`、`config`、`action`、`member`）、`commitIndex`、`lastApplied`、`applied`（同样以 `kind` 区分两类条目）；提供 `snapshotThreshold` 时另含 `snapshot`（`{"lastIncludedIndex", "lastIncludedTerm"}`，未创建快照时为 `null`）；提供 `nodeEvents` 时另含 `online` 与 `restartCount`；提供成员变更字段时另含 `membershipRole`（按该节点最新配置取 `voter` 或 `learner`）。
+- `membership`（仅在提供成员变更字段时出现）：
+  - `initial`：初始投票集合；`current`：当前已提交的稳定投票集合（联合阶段仍为旧稳定集合）；`joint`：联合阶段为 `{"id", "old", "new"}`，否则为 `null`。
+  - `changes`：按输入顺序给出每个 id 的结局：`committed`（含稳定配置项的 `index`、`term`）、`pending`（含 `phase: "catchingUp"` 或 `phase: "joint"`，后者另含 `joint`）或 `rejected`（含 `reason`）。
 - `clients`：按输入顺序汇总每个 `id` 的最终结局，恰为四类之一：
   - `committed`：已被某节点应用（含最终 `index`、`term`；已被快照压缩的命令同样归入此类），同一 `id` 至多一次。
   - `superseded`：曾被接受但在提交前被更高任期的日志覆盖删除。
   - `pending`：仍存在于某节点日志中但未达提交多数。
   - `rejected`：发给非 leader（`reason: notLeader`）或离线节点（`reason: nodeDown`，`knownLeader` 为 `null`），含 `reason`、`knownLeader`。
 - `electionSafety`：`leadersByTerm` 按任期列出当选的 leader；同一任期出现多个 leader 时记入 `violations`，否则为空列表。
-- `logMatching`：`violations` 列出“同索引同任期但内容（id/command）不同”的情况；跨快照边界检查（已压缩索引取自已应用历史）。
-- `stateMachineSafety`：`violations` 列出不同节点在同一索引应用了不同命令的情况（跨快照边界检查）。
+- `logMatching`：`violations` 列出“同索引同任期但内容（客户命令的 id/command，或配置项负载）不同”的情况；跨配置项与快照边界检查（已压缩索引取自已应用历史）。
+- `stateMachineSafety`：`violations` 列出不同节点在同一索引应用了不同条目的情况（配置项与客户命令一并参与索引对齐，并跨快照边界检查）。
 
-未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息，既有合法场景的输出逐字节不变。
+未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息；未同时提供 `initialMembers` 与 `membershipChanges` 时，不新增 `membership` 汇总、`membershipRole`、成员事件与配置项标记，既有合法场景的输出逐字节不变。
 
 ### 错误
 
-文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
 ## 现有公开接口
 
@@ -106,5 +124,6 @@ consensus-protocol-lab --help               # 打印用法
 
 ## 限制
 
-- 实现 Raft 选主、心跳、日志复制/提交、快照与日志压缩，以及节点崩溃与基于持久化状态的重启恢复；不包含集群成员变更。
+- 实现 Raft 选主、心跳、日志复制/提交、快照与日志压缩、联合共识（joint consensus）成员变更，以及节点崩溃与基于持久化状态的重启恢复。
+- 成员变更采用联合共识两阶段（联合配置项提交后再提交稳定配置项）；learner 先追平日志再进入联合集合；不实现单节点一次多变更等额外成员变更扩展。
 - 仿真不读取墙钟、不使用随机数；持久化为同步建模，不在磁盘上创建任何文件。

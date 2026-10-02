@@ -22,8 +22,12 @@ _KIND_CLIENT = 3
 # here so that, even with zero message delay, all client commands sharing a
 # timestamp are handled in input order before their reactions drain.
 _KIND_REACTION = 4
-_KIND_TIMEOUT = 5
-_KIND_HEARTBEAT = 6
+# Membership requests sit behind every pending reaction: the heap keeps
+# (t, REACTION, ...) entries ahead of (t, MEMBERSHIP, ...), so a request's own
+# zero-delay cascade likewise drains before the next timed event.
+_KIND_MEMBERSHIP = 5
+_KIND_TIMEOUT = 6
+_KIND_HEARTBEAT = 7
 
 _TOP_LEVEL_FIELDS = {
     "nodes",
@@ -35,16 +39,28 @@ _TOP_LEVEL_FIELDS = {
     "clientCommands",
     "nodeEvents",
     "snapshotThreshold",
+    "initialMembers",
+    "membershipChanges",
 }
 _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "faults",
     "clientCommands",
     "nodeEvents",
     "snapshotThreshold",
+    "initialMembers",
+    "membershipChanges",
 }
 _FAULT_FIELDS = {"time", "action", "groups"}
 _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 _NODE_EVENT_FIELDS = {"time", "node", "action"}
+_MEMBERSHIP_CHANGE_FIELDS = {"time", "node", "id", "action", "member"}
+
+# Log-entry kinds: ordinary client commands versus replicated configuration
+# entries created by joint-consensus membership changes.
+KIND_COMMAND = "command"
+KIND_CONFIG = "config"
+CONFIG_JOINT = "joint"
+CONFIG_STABLE = "stable"
 
 
 class ScenarioError(Exception):
@@ -233,6 +249,87 @@ def parse_scenario(raw: object) -> dict:
             raw["snapshotThreshold"], "snapshotThreshold", 1
         )
 
+    has_initial_members = "initialMembers" in raw
+    has_membership_changes = "membershipChanges" in raw
+    if has_initial_members != has_membership_changes:
+        raise ScenarioError(
+            "initialMembers and membershipChanges must be provided together"
+        )
+
+    initial_members: list[str] | None = None
+    membership_enabled = has_initial_members
+    if has_initial_members:
+        raw_initial = raw["initialMembers"]
+        if not isinstance(raw_initial, list) or len(raw_initial) < 3:
+            raise ScenarioError(
+                "initialMembers must be a list of at least three node names"
+            )
+        for name in raw_initial:
+            if not isinstance(name, str) or not name:
+                raise ScenarioError("initialMembers entries must be non-empty strings")
+            if name not in node_set:
+                raise ScenarioError(
+                    f"initialMembers references unknown node: {name!r}"
+                )
+        if len(set(raw_initial)) != len(raw_initial):
+            raise ScenarioError("initialMembers entries must be unique")
+        initial_members = list(raw_initial)
+
+        raw_changes = raw["membershipChanges"]
+        if not isinstance(raw_changes, list):
+            raise ScenarioError("membershipChanges must be a list")
+        seen_change_ids: set[str] = set()
+        normalized_changes = []
+        for index, change in enumerate(raw_changes):
+            label = f"membershipChanges[{index}]"
+            if not isinstance(change, dict):
+                raise ScenarioError(f"{label} must be an object")
+            unknown = sorted(set(change) - _MEMBERSHIP_CHANGE_FIELDS)
+            if unknown:
+                raise ScenarioError(f"{label} has unknown field(s): {', '.join(unknown)}")
+            missing = sorted(_MEMBERSHIP_CHANGE_FIELDS - set(change))
+            if missing:
+                raise ScenarioError(f"{label} missing field(s): {', '.join(missing)}")
+            time = _require_int(change["time"], f"{label}.time", 0)
+            if time > duration:
+                raise ScenarioError(f"{label}.time is beyond the simulation duration")
+            node = change["node"]
+            if not isinstance(node, str) or not node:
+                raise ScenarioError(f"{label}.node must be a non-empty string")
+            if node not in node_set:
+                raise ScenarioError(f"{label}.node references unknown node: {node!r}")
+            change_id = change["id"]
+            if not isinstance(change_id, str) or not change_id:
+                raise ScenarioError(f"{label}.id must be a non-empty string")
+            if change_id in seen_change_ids:
+                raise ScenarioError(
+                    f"{label}.id duplicates a previous id: {change_id!r}"
+                )
+            seen_change_ids.add(change_id)
+            if change_id in seen_ids:
+                raise ScenarioError(
+                    f"{label}.id duplicates a clientCommands id: {change_id!r}"
+                )
+            action = change["action"]
+            if action not in ("add", "remove"):
+                raise ScenarioError(f"{label}.action must be add or remove")
+            member = change["member"]
+            if not isinstance(member, str) or not member:
+                raise ScenarioError(f"{label}.member must be a non-empty string")
+            if member not in node_set:
+                raise ScenarioError(
+                    f"{label}.member references unknown node: {member!r}"
+                )
+            normalized_changes.append(
+                {
+                    "time": time,
+                    "node": node,
+                    "id": change_id,
+                    "action": action,
+                    "member": member,
+                }
+            )
+
     return {
         "nodes": list(nodes),
         "duration": duration,
@@ -244,6 +341,9 @@ def parse_scenario(raw: object) -> dict:
         "nodeEvents": normalized_node_events,
         "nodeEventsProvided": node_events_provided,
         "snapshotThreshold": snapshot_threshold,
+        "membershipEnabled": membership_enabled,
+        "initialMembers": initial_members,
+        "membershipChanges": normalized_changes if has_initial_members else None,
     }
 
 
@@ -258,6 +358,7 @@ class _Node:
         "log",
         "snapshot_index",
         "snapshot_term",
+        "snapshot_config",
         "commit_index",
         "last_applied",
         "applied",
@@ -281,6 +382,10 @@ class _Node:
         self.log: list[dict] = []
         self.snapshot_index = 0
         self.snapshot_term = 0
+        # Configuration in effect at snapshot_index (None before any
+        # snapshot). Config entries can be compacted into snapshots like any
+        # committed entry, so membership survives compaction.
+        self.snapshot_config: dict | None = None
         self.commit_index = 0
         self.last_applied = 0
         self.applied: list[dict] = []
@@ -288,11 +393,11 @@ class _Node:
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
         # Crash/restart lifecycle. term, voted_for, log, snapshot_index,
-        # snapshot_term, commit_index, last_applied and applied model
-        # persisted state: every change to them is made (synchronously) before
-        # the response that depends on it, so they survive a crash and are
-        # simply kept on restart. Everything else is volatile and is reset
-        # when the node comes back up.
+        # snapshot_term, snapshot_config, commit_index, last_applied, applied
+        # and the configuration encoded in the log all model persisted state:
+        # every change to them is made (synchronously) before the response that
+        # depends on it, so they survive a crash and are simply kept on
+        # restart. Everything else is volatile and is reset on restart.
         self.online = True
         self.restart_count = 0
 
@@ -314,6 +419,40 @@ class _Node:
     def has_entry(self, index: int) -> bool:
         return self.snapshot_index < index <= self.last_log_index()
 
+    def config_at(self, index: int, initial_config: dict) -> dict | None:
+        """The configuration in effect immediately *before* the entry at
+        ``index`` is applied: the latest config entry with a smaller index, or
+        the snapshot config / initial configuration. Returns None when no
+        configuration entry precedes ``index`` (the caller substitutes the
+        initial configuration)."""
+        config = self.snapshot_config if self.snapshot_config else initial_config
+        upper = min(index - 1, self.last_log_index())
+        for i in range(self.snapshot_index + 1, upper + 1):
+            entry = self.log[i - 1 - self.snapshot_index]
+            if entry.get("kind") == KIND_CONFIG:
+                config = entry["config"]
+        return config
+
+    def latest_config(self, initial_config: dict) -> dict:
+        """The newest configuration present in this node's log (or its
+        snapshot), whether or not it is committed or applied."""
+        result = self.snapshot_config if self.snapshot_config else initial_config
+        for entry in self.log:
+            if entry.get("kind") == KIND_CONFIG:
+                result = entry["config"]
+        return result
+
+    def committed_config(self, initial_config: dict) -> dict:
+        """The configuration established by the newest committed config
+        entry (or the snapshot config, which only covers committed state)."""
+        config = self.snapshot_config if self.snapshot_config else initial_config
+        upper = min(self.commit_index, self.last_log_index())
+        for i in range(self.snapshot_index + 1, upper + 1):
+            entry = self.log[i - 1 - self.snapshot_index]
+            if entry.get("kind") == KIND_CONFIG:
+                config = entry["config"]
+        return config
+
 
 class _Simulator:
     def __init__(self, config: dict) -> None:
@@ -327,9 +466,20 @@ class _Simulator:
         self.node_events: list[dict] = config["nodeEvents"]
         self.node_events_provided: bool = config["nodeEventsProvided"]
         self.snapshot_threshold: int | None = config["snapshotThreshold"]
+        self.membership_enabled: bool = config["membershipEnabled"]
+        self.changes: list[dict] = config["membershipChanges"] or []
+        if self.membership_enabled:
+            initial_members = frozenset(config["initialMembers"])
+            self.initial_config: dict = {
+                "type": CONFIG_STABLE,
+                "old": initial_members,
+                "new": initial_members,
+            }
+        else:
+            all_nodes = frozenset(self.node_names)
+            self.initial_config = {"type": CONFIG_STABLE, "old": all_nodes, "new": all_nodes}
         self.state = {name: _Node() for name in self.node_names}
         self.index = {name: i for i, name in enumerate(self.node_names)}
-        self.majority = len(self.node_names) // 2 + 1
         self.timeline: list[dict] = []
         self.leaders_by_term: dict[int, list[str]] = {}
         self.partition: list[frozenset[str]] | None = None
@@ -345,6 +495,16 @@ class _Simulator:
         # are derived from the end state; reason and knownLeader are captured
         # at rejection time.
         self.rejected: dict[str, dict] = {}
+        # Membership-change bookkeeping.
+        # change_id -> {"node", "action", "member", "result", "index"?, "term"?,
+        #               "jointIndex"?, "stableIndex"?, "reason"?}
+        self.change_results: dict[str, dict] = {}
+        # change_id of the change whose joint entry is committed but whose
+        # stable entry has not been appended yet, if any.
+        # Learner catch-up state for the in-progress add: once the target
+        # learner's matchIndex reaches the pre-joint log end, the leader
+        # appends the joint config entry.
+        self.pending_catchup: dict | None = None
 
     def run(self) -> dict:
         for order, fault in enumerate(self.faults):
@@ -353,14 +513,17 @@ class _Simulator:
             heapq.heappush(self.queue, (event["time"], _KIND_NODE_EVENT, order, event))
         for order, command in enumerate(self.commands):
             heapq.heappush(self.queue, (command["time"], _KIND_CLIENT, order, command))
+        for order, change in enumerate(self.changes):
+            heapq.heappush(self.queue, (change["time"], _KIND_MEMBERSHIP, order, change))
         for name in self.node_names:
-            heapq.heappush(self.queue, (self.timeouts[name], _KIND_TIMEOUT, self.index[name], (name, 0)))
+            if self._is_voter(name, self.initial_config):
+                heapq.heappush(self.queue, (self.timeouts[name], _KIND_TIMEOUT, self.index[name], (name, 0)))
         while self.queue:
             time, kind, _order, payload = heapq.heappop(self.queue)
             if time > self.duration:
                 break
             self.now = time
-            self.reaction_phase = kind in (_KIND_CLIENT, _KIND_REACTION)
+            self.reaction_phase = kind in (_KIND_CLIENT, _KIND_MEMBERSHIP, _KIND_REACTION)
             if kind == _KIND_FAULT:
                 self._apply_fault(payload)
             elif kind == _KIND_NODE_EVENT:
@@ -369,6 +532,8 @@ class _Simulator:
                 self._deliver(payload)
             elif kind == _KIND_CLIENT:
                 self._on_client_command(payload)
+            elif kind == _KIND_MEMBERSHIP:
+                self._on_membership_change(payload)
             elif kind == _KIND_TIMEOUT:
                 self._on_timeout(*payload)
             else:
@@ -384,15 +549,116 @@ class _Simulator:
         st = self.state[name]
         self._record({"type": "stateChange", "node": name, "term": st.term, "role": st.role, "reason": reason})
 
+    # -- configuration -------------------------------------------------------
+
+    def _command_entry(self, index: int, term: int, command_id: str, command: object) -> dict:
+        """A client-command log/applied entry. When membership changes are
+        enabled it carries ``kind: "command"`` so configuration entries
+        (``kind: "config"``) are unambiguously distinguishable; without the
+        feature the historical, untyped shape is preserved byte for byte."""
+        entry = {"index": index, "term": term}
+        if self.membership_enabled:
+            entry["kind"] = KIND_COMMAND
+        entry["id"] = command_id
+        entry["command"] = command
+        return entry
+
+    @staticmethod
+    def _config_groups(config: dict) -> tuple[frozenset[str], frozenset[str]]:
+        """The (old, new) voter sets of a configuration. Stable configurations
+        carry the same set twice; joint configurations carry both."""
+        return frozenset(config["old"]), frozenset(config["new"])
+
+    def _config_quorums(self, config: dict) -> list[frozenset[str]]:
+        old, new = self._config_groups(config)
+        if config.get("type") == CONFIG_JOINT:
+            return [old, new]
+        return [new]
+
+    def _is_voter(self, name: str, config: dict) -> bool:
+        old, new = self._config_groups(config)
+        return name in old or name in new
+
+    def _can_vote(self, name: str) -> bool:
+        """Current voting/election eligibility from the node's newest
+        configuration: learners and nodes not present in the latest config
+        neither vote nor campaign. A removed node that learns a configuration
+        adding it back regains eligibility."""
+        st = self.state[name]
+        return self._is_voter(name, st.latest_config(self.initial_config))
+
+    @staticmethod
+    def _store_config(config: dict) -> dict:
+        old, new = _Simulator._config_groups(config)
+        return {
+            "type": config.get("type", CONFIG_STABLE),
+            "old": sorted(old),
+            "new": sorted(new),
+        }
+
+    def _joint_config(self, voters: frozenset[str], action: str, member: str) -> dict:
+        if action == "add":
+            new_voters = voters | {member}
+        else:
+            new_voters = voters - {member}
+        return {"type": CONFIG_JOINT, "old": sorted(voters), "new": sorted(new_voters)}
+
+    @staticmethod
+    def _stable_config(voters: frozenset[str]) -> dict:
+        ordered = sorted(voters)
+        return {"type": CONFIG_STABLE, "old": ordered, "new": ordered}
+
+    def _has_vote_majorities(self, candidate: str, votes: set[str], config: dict) -> bool:
+        for group in self._config_quorums(config):
+            needed = len(group) // 2 + 1
+            if len([v for v in votes if v in group]) < needed:
+                return False
+        return True
+
+    def _replicated_by_majorities(self, leader: str, index: int, config: dict) -> bool:
+        """Whether ``index`` is present on a strict majority of every quorum
+        group (the leader itself counts in any group it belongs to)."""
+        st = self.state[leader]
+        for group in self._config_quorums(config):
+            needed = len(group) // 2 + 1
+            points = []
+            for peer in group:
+                if peer == leader:
+                    points.append(st.last_log_index())
+                else:
+                    points.append(st.match_index.get(peer, 0))
+            if len([point for point in points if point >= index]) < needed:
+                return False
+        return True
+
     # -- state transitions --------------------------------------------------
+
+    def _invalidate_timeout(self, name: str) -> None:
+        self.state[name].timeout_gen += 1
 
     def _reset_timeout(self, name: str) -> None:
         st = self.state[name]
+        if not self._can_vote(name):
+            # Learners and removed members hold no election timer; bumping the
+            # generation cancels any timer scheduled before their membership
+            # changed.
+            st.timeout_gen += 1
+            return
         st.timeout_gen += 1
         heapq.heappush(
             self.queue,
             (self.now + self.timeouts[name], _KIND_TIMEOUT, self.index[name], (name, st.timeout_gen)),
         )
+
+    def _reconcile_election_timer(self, name: str, eligible_before: bool) -> None:
+        """Start or cancel a node's election timer when its configuration
+        membership changes (e.g. a learner promoted by a replicated joint
+        entry, or a member removed by a replicated stable entry)."""
+        eligible_after = self._can_vote(name)
+        if eligible_after and not eligible_before:
+            self._reset_timeout(name)
+        elif eligible_before and not eligible_after:
+            self._invalidate_timeout(name)
 
     def _become_follower(self, name: str, term: int, reason: str) -> None:
         st = self.state[name]
@@ -408,6 +674,10 @@ class _Simulator:
 
     def _start_election(self, name: str) -> None:
         st = self.state[name]
+        # The election is decided under the configuration in place just
+        # before the candidate appends anything (joint configs require
+        # majorities of both constituent sets).
+        config = st.latest_config(self.initial_config)
         st.role = ROLE_CANDIDATE
         st.term += 1
         st.voted_for = name
@@ -418,7 +688,7 @@ class _Simulator:
         self._reset_timeout(name)
         self._record_state_change(name, "electionTimeout")
         for peer in self.node_names:
-            if peer != name:
+            if peer != name and self._is_voter(peer, config):
                 self._send(
                     name,
                     peer,
@@ -430,13 +700,15 @@ class _Simulator:
                     },
                 )
 
-    def _become_leader(self, name: str) -> None:
+    def _become_leader(self, name: str, config: dict) -> None:
         st = self.state[name]
         st.role = ROLE_LEADER
         st.known_leader = name
         st.votes = set()
         st.timeout_gen += 1  # leaders have no election timeout
         next_index = st.last_log_index() + 1
+        # Replication progress is tracked for every other node: voters count
+        # towards quorums, learners receive the log but never count.
         st.next_index = {peer: next_index for peer in self.node_names if peer != name}
         st.match_index = {peer: 0 for peer in self.node_names if peer != name}
         self._record_state_change(name, "majority")
@@ -444,6 +716,52 @@ class _Simulator:
         if name not in leaders:
             leaders.append(name)
         self._send_heartbeats(name)
+        self._resume_membership_change(name)
+
+    def _resume_membership_change(self, name: str) -> None:
+        """Finish a change a previous leader left open. If the newest config
+        entry present is a joint entry (with no stable entry following it),
+        append the stable entry now: winning this term's election required
+        majorities of both joint sets, so the joint entry is known to be on
+        those majorities even before commitIndex advanced to it."""
+        st = self.state[name]
+        if st.latest_config(self.initial_config).get("type") == CONFIG_JOINT:
+            joint_entry = None
+            # Newest joint entry in the uncompacted log, otherwise the newest
+            # one folded into the snapshot's applied history.
+            for log_entry in reversed(st.log):
+                if log_entry.get("kind") == KIND_CONFIG and log_entry["entryType"] == CONFIG_JOINT:
+                    joint_entry = log_entry
+                    break
+            if joint_entry is None:
+                for applied in reversed(st.applied):
+                    if (
+                        applied.get("kind") == KIND_CONFIG
+                        and applied["entryType"] == CONFIG_JOINT
+                    ):
+                        joint_entry = applied
+                        break
+            if joint_entry is not None:
+                _old, new_voters = self._config_groups(joint_entry["config"])
+                stable = self._stable_config(new_voters)
+                self._append_config_entry(
+                    name,
+                    joint_entry["id"],
+                    CONFIG_STABLE,
+                    stable,
+                    joint_entry["action"],
+                    joint_entry["member"],
+                )
+                for peer in self.node_names:
+                    if peer != name:
+                        self._replicate_to(name, peer)
+        if self.pending_catchup is not None:
+            if self.pending_catchup["leader"] != name:
+                # The old leader was replaced before it appended the joint
+                # entry; the unfinished catch-up is abandoned.
+                self.pending_catchup = None
+            else:
+                self._progress_catchup(name)
 
     # -- messages -----------------------------------------------------------
 
@@ -579,8 +897,12 @@ class _Simulator:
                 and msg["lastLogIndex"] >= st.last_log_index()
             )
         )
+        # Learners and removed members never grant a vote; candidates only
+        # solicit voters, so stale RVs reaching a demoted node are denied.
+        eligible_voter = self._can_vote(dst)
         granted = (
-            msg["term"] >= st.term
+            eligible_voter
+            and msg["term"] >= st.term
             and up_to_date
             and (effective_voted_for is None or effective_voted_for == src)
         )
@@ -604,12 +926,13 @@ class _Simulator:
         st = self.state[dst]
         detail = "ignored"
         elected = False
+        election_config = st.latest_config(self.initial_config)
         if msg["term"] > st.term:
             detail = "higherTerm"
         elif st.role == ROLE_CANDIDATE and msg["term"] == st.term and msg["granted"]:
             st.votes.add(src)
             detail = "voteCounted"
-            elected = len(st.votes) >= self.majority
+            elected = self._has_vote_majorities(dst, st.votes, election_config)
         self._record({
             "type": "messageResult",
             "node": dst,
@@ -622,7 +945,7 @@ class _Simulator:
         if msg["term"] > st.term:
             self._become_follower(dst, msg["term"], "higherTermMessage")
         elif elected:
-            self._become_leader(dst)
+            self._become_leader(dst, election_config)
 
     def _handle_heartbeat(self, msg: dict) -> None:
         src, dst = msg["src"], msg["dst"]
@@ -699,6 +1022,12 @@ class _Simulator:
             )
             return
 
+        # Latest configuration decides voting/campaigning as soon as an entry
+        # is appended, so start or stop the election timer when the batch
+        # changes this node's membership. Compute eligibility before any
+        # truncation or append.
+        eligible_before = self._can_vote(dst)
+
         # Truncate the suffix at the first position whose term differs.
         conflict_index = 0
         for offset, entry in enumerate(msg["entries"]):
@@ -713,17 +1042,36 @@ class _Simulator:
         for offset, entry in enumerate(msg["entries"]):
             index = prev_index + 1 + offset
             if index > st.last_log_index():
-                st.log.append(
-                    {
+                if entry.get("kind") == KIND_CONFIG:
+                    stored = {
                         "index": index,
                         "term": entry["term"],
+                        "kind": KIND_CONFIG,
                         "id": entry["id"],
-                        "command": entry["command"],
+                        "entryType": entry["entryType"],
+                        "config": entry["config"],
+                        "action": entry["action"],
+                        "member": entry["member"],
                     }
-                )
+                else:
+                    stored = self._command_entry(
+                        index, entry["term"], entry["id"], entry["command"]
+                    )
+                st.log.append(stored)
                 appended += 1
 
-        self._record({
+        self._reconcile_election_timer(dst, eligible_before)
+
+        config_entries = [
+            {
+                "index": entry["index"],
+                "id": entry["id"],
+                "entryType": entry["entryType"],
+            }
+            for entry in msg["entries"]
+            if entry.get("kind") == KIND_CONFIG
+        ]
+        result_entry = {
             "type": "messageResult",
             "node": dst,
             "peer": src,
@@ -734,7 +1082,12 @@ class _Simulator:
             "prevLogIndex": prev_index,
             "appended": appended,
             "lastLogIndex": st.last_log_index(),
-        })
+        }
+        if config_entries:
+            # Configuration replication is reported separately from ordinary
+            # client-command replication.
+            result_entry["configEntries"] = config_entries
+        self._record(result_entry)
 
         if msg["leaderCommit"] > st.commit_index:
             st.commit_index = min(msg["leaderCommit"], st.last_log_index())
@@ -816,11 +1169,18 @@ class _Simulator:
         # Accept the snapshot. A suffix entry at the snapshot boundary with a
         # matching term is still valid and is kept; any other suffix is
         # discarded, including a same-position entry from a different term.
+        eligible_before = self._can_vote(dst)
         keep = (
             st.has_entry(included_index)
             and st.term_at(included_index) == included_term
         )
         snapshot_entries = [dict(entry) for entry in msg["entries"]]
+        # Recover the configuration in force at the snapshot position from
+        # the applied entries bundled into the snapshot.
+        snap_config = None
+        for bundled in snapshot_entries:
+            if bundled.get("kind") == KIND_CONFIG:
+                snap_config = bundled["config"]
         if keep:
             # The entry at included_index joins the snapshot; retain only the
             # entries strictly following it, together with whatever the
@@ -838,6 +1198,7 @@ class _Simulator:
             st.applied = snapshot_entries
         st.snapshot_index = included_index
         st.snapshot_term = included_term
+        st.snapshot_config = snap_config
         if st.commit_index < included_index:
             st.commit_index = included_index
         st.last_applied = len(st.applied)
@@ -860,6 +1221,9 @@ class _Simulator:
             "lastIncludedIndex": included_index,
             "lastIncludedTerm": included_term,
         })
+        # Configuration and membership arrive as already-restored state, just
+        # like commands: no configurationApplied events are emitted for them.
+        self._restore_membership_from_snapshot(dst, snapshot_entries, snap_config, eligible_before)
         # Apply whatever suffix entries are now committed beyond the snapshot.
         self._advance_apply(dst)
         self._send(
@@ -874,6 +1238,38 @@ class _Simulator:
                 "lastLogIndex": st.last_log_index(),
             },
         )
+
+    def _restore_membership_from_snapshot(
+        self,
+        name: str,
+        bundled_entries: list[dict],
+        snap_config: dict | None,
+        eligible_before: bool,
+    ) -> None:
+        """Restore voting membership and change outcomes from the applied
+        entries folded into a received snapshot without re-applying them."""
+        if snap_config is not None:
+            eligible_after = self._is_voter(name, snap_config)
+            if eligible_after and not eligible_before:
+                self._reset_timeout(name)
+            elif eligible_before and not eligible_after:
+                self._invalidate_timeout(name)
+        for bundled in bundled_entries:
+            if bundled.get("kind") != KIND_CONFIG:
+                continue
+            change_id = bundled["id"]
+            result = self.change_results.get(change_id)
+            if result is None:
+                continue
+            if bundled["entryType"] == CONFIG_STABLE:
+                if result.get("outcome") != "committed":
+                    result["outcome"] = "committed"
+                    result["index"] = bundled["index"]
+                    result["term"] = bundled["term"]
+                result.pop("jointPhase", None)
+            else:
+                old, new = self._config_groups(bundled["config"])
+                result["jointPhase"] = {"id": change_id, "old": sorted(old), "new": sorted(new)}
 
     def _handle_snapshot_reply(self, msg: dict) -> None:
         src, dst = msg["src"], msg["dst"]
@@ -921,6 +1317,7 @@ class _Simulator:
             })
             # Resume log replication from the entry right after the snapshot.
             self._replicate_to(dst, src)
+            self._progress_catchup(dst)
             return
 
         if result == "staleTerm":
@@ -984,7 +1381,10 @@ class _Simulator:
             return
 
         if msg["success"]:
-            match = msg["matchIndex"]
+            # A follower with a longer divergent suffix can acknowledge a
+            # batch whose shared positions already match; the leader must not
+            # treat positions beyond its own log end as replicated.
+            match = min(msg["matchIndex"], st.last_log_index())
             advanced = match > st.match_index[src]
             if advanced:
                 st.match_index[src] = match
@@ -1002,6 +1402,7 @@ class _Simulator:
             })
             if advanced:
                 self._advance_leader_commit(dst)
+            self._progress_catchup(dst)
             return
 
         # Deterministic backoff: retry one log position earlier.
@@ -1049,9 +1450,7 @@ class _Simulator:
             return
 
         index = st.last_log_index() + 1
-        st.log.append(
-            {"index": index, "term": st.term, "id": command_id, "command": command["command"]}
-        )
+        st.log.append(self._command_entry(index, st.term, command_id, command["command"]))
         self._record({
             "type": "clientResult",
             "node": node,
@@ -1064,21 +1463,192 @@ class _Simulator:
             if peer != node:
                 self._replicate_to(node, peer)
 
+    # -- membership changes --------------------------------------------------
+
+    def _change_in_progress(self, st: _Node, leader: str) -> bool:
+        pending = self.pending_catchup
+        if pending is not None and pending["leader"] == leader and st.role == ROLE_LEADER:
+            return True
+        # The change runs until its stable entry commits: a committed joint
+        # config, or any not-yet-committed config entry (the appended stable
+        # entry), both keep the cluster busy.
+        if st.committed_config(self.initial_config).get("type") == CONFIG_JOINT:
+            return True
+        return any(
+            entry.get("kind") == KIND_CONFIG and entry["index"] > st.commit_index
+            for entry in st.log
+        )
+
+    def _record_membership_rejected(self, change: dict, reason: str) -> None:
+        change_id = change["id"]
+        self.change_results[change_id] = {
+            "node": change["node"],
+            "action": change["action"],
+            "member": change["member"],
+            "outcome": "rejected",
+            "reason": reason,
+        }
+        self._record({
+            "type": "membershipResult",
+            "node": change["node"],
+            "id": change_id,
+            "action": change["action"],
+            "member": change["member"],
+            "result": "rejected",
+            "reason": reason,
+        })
+
+    def _on_membership_change(self, change: dict) -> None:
+        node = change["node"]
+        change_id = change["id"]
+        action = change["action"]
+        member = change["member"]
+        st = self.state[node]
+        # Rejection precedence: receiver down -> not the leader -> another
+        # change already running -> member state not applicable -> removing
+        # would leave fewer than three voters.
+        if not st.online:
+            self._record_membership_rejected(change, "nodeDown")
+            return
+        if st.role != ROLE_LEADER:
+            self._record_membership_rejected(change, "notLeader")
+            return
+        if self._change_in_progress(st, node):
+            self._record_membership_rejected(change, "changeInProgress")
+            return
+        _, voters = self._config_groups(st.committed_config(self.initial_config))
+        voters = frozenset(voters)
+        if action == "add":
+            if member in voters:
+                self._record_membership_rejected(change, "alreadyMember")
+                return
+            new_voters = voters | {member}
+        else:
+            if member not in voters:
+                self._record_membership_rejected(change, "notMember")
+                return
+            new_voters = voters - {member}
+        if len(new_voters) < 3:
+            self._record_membership_rejected(change, "minimumClusterSize")
+            return
+
+        self.change_results[change_id] = {
+            "node": node,
+            "action": action,
+            "member": member,
+            "outcome": "pending",
+        }
+        if action == "add":
+            # The learner must first receive the log (or a snapshot) until it
+            # matches the leader; only then is the joint config entry
+            # appended. Heartbeats already stream entries to every node, but
+            # replicate immediately so catch-up starts at once.
+            self.pending_catchup = {
+                "id": change_id,
+                "member": member,
+                "action": action,
+                "leader": node,
+            }
+            self._record({
+                "type": "membershipResult",
+                "node": node,
+                "id": change_id,
+                "action": action,
+                "member": member,
+                "result": "accepted",
+                "phase": "catchingUp",
+            })
+            self._replicate_to(node, member)
+            self._progress_catchup(node)
+        else:
+            self._record({
+                "type": "membershipResult",
+                "node": node,
+                "id": change_id,
+                "action": action,
+                "member": member,
+                "result": "accepted",
+            })
+            self._append_joint_entry(node, change_id, action, member, voters)
+
+    def _append_config_entry(
+        self, name: str, change_id: str, entry_type: str, config: dict, action: str, member: str
+    ) -> dict:
+        st = self.state[name]
+        entry = {
+            "index": st.last_log_index() + 1,
+            "term": st.term,
+            "kind": KIND_CONFIG,
+            "id": change_id,
+            "entryType": entry_type,
+            "config": self._store_config(config),
+            "action": action,
+            "member": member,
+        }
+        st.log.append(entry)
+        return entry
+
+    def _append_joint_entry(
+        self, name: str, change_id: str, action: str, member: str, voters: frozenset[str]
+    ) -> None:
+        joint = self._joint_config(voters, action, member)
+        entry = self._append_config_entry(name, change_id, CONFIG_JOINT, joint, action, member)
+        for peer in self.node_names:
+            if peer != name:
+                self._replicate_to(name, peer)
+
+    def _progress_catchup(self, name: str) -> None:
+        """Append the joint entry once the added learner has caught the
+        leader's log end (via log replication or an installed snapshot)."""
+        pending = self.pending_catchup
+        if pending is None:
+            return
+        st = self.state[name]
+        if st.role != ROLE_LEADER or pending["leader"] != name:
+            return
+        member = pending["member"]
+        latest = st.latest_config(self.initial_config)
+        if latest.get("type") == CONFIG_JOINT:
+            # Another change already moved the cluster into a joint phase.
+            return
+        _, voters = self._config_groups(st.committed_config(self.initial_config))
+        voters = frozenset(voters)
+        if (pending["action"] == "add") == (member in voters):
+            # The requested relationship no longer matches committed state.
+            return
+        if st.match_index.get(member, 0) < st.last_log_index():
+            return
+        self.pending_catchup = None
+        self._append_joint_entry(name, pending["id"], pending["action"], member, voters)
+
     # -- commit and apply ---------------------------------------------------
 
     def _advance_leader_commit(self, name: str) -> None:
         st = self.state[name]
         replicated = sorted([st.last_log_index()] + list(st.match_index.values()), reverse=True)
-        candidate = replicated[self.majority - 1]
-        if candidate > st.commit_index and st.term_at(candidate) == st.term:
-            st.commit_index = candidate
-            self._record({
-                "type": "commitAdvance",
-                "node": name,
-                "term": st.term,
-                "commitIndex": st.commit_index,
-            })
-            self._advance_apply(name)
+        # Entries replicated while a joint configuration is active need
+        # strict majorities of BOTH voter sets; entries before/after it use
+        # the single stable set.
+        for candidate in replicated:
+            if candidate <= st.commit_index:
+                break
+            if st.term_at(candidate) != st.term:
+                continue
+            # A server uses the newest config in its log as soon as it is
+            # appended, so the joint entry is committed by majorities of
+            # BOTH sets; the stable entry is only appended after the joint
+            # entry commits, so it and later entries use the new single set.
+            config = st.config_at(candidate + 1, self.initial_config)
+            if self._replicated_by_majorities(name, candidate, config):
+                st.commit_index = candidate
+                self._record({
+                    "type": "commitAdvance",
+                    "node": name,
+                    "term": st.term,
+                    "commitIndex": st.commit_index,
+                })
+                self._advance_apply(name)
+                return
 
     def _advance_apply(self, name: str) -> None:
         st = self.state[name]
@@ -1088,33 +1658,141 @@ class _Simulator:
                 break
             st.last_applied = next_index
             entry = st.log[next_index - 1 - st.snapshot_index]
-            st.applied.append(
-                {"index": entry["index"], "term": entry["term"], "id": entry["id"], "command": entry["command"]}
-            )
-            self._record({
-                "type": "applied",
-                "node": name,
-                "index": entry["index"],
-                "term": entry["term"],
-                "id": entry["id"],
-            })
+            if entry.get("kind") == KIND_CONFIG:
+                st.applied.append(self._applied_config_view(entry))
+                self._apply_config_entry(name, entry)
+            else:
+                st.applied.append(
+                    self._command_entry(
+                        entry["index"], entry["term"], entry["id"], entry["command"]
+                    )
+                )
+                self._record({
+                    "type": "applied",
+                    "node": name,
+                    "index": entry["index"],
+                    "term": entry["term"],
+                    "id": entry["id"],
+                })
             if (
                 self.snapshot_threshold is not None
                 and st.last_applied - st.snapshot_index >= self.snapshot_threshold
             ):
                 self._create_snapshot(name)
 
+    @staticmethod
+    def _applied_config_view(entry: dict) -> dict:
+        return {
+            "index": entry["index"],
+            "term": entry["term"],
+            "id": entry["id"],
+            "kind": KIND_CONFIG,
+            "entryType": entry["entryType"],
+            "config": entry["config"],
+            "action": entry["action"],
+            "member": entry["member"],
+        }
+
+    @staticmethod
+    def _has_following_stable(st: _Node, joint_entry: dict) -> bool:
+        """Whether a stable entry for the same change already follows the
+        joint entry in this node's log (e.g. appended when this leader first
+        won the election)."""
+        for log_entry in st.log:
+            if (
+                log_entry["index"] > joint_entry["index"]
+                and log_entry.get("kind") == KIND_CONFIG
+                and log_entry["entryType"] == CONFIG_STABLE
+                and log_entry["id"] == joint_entry["id"]
+            ):
+                return True
+        return False
+
+    def _apply_config_entry(self, name: str, entry: dict) -> None:
+        """React to a newly committed configuration: emit configurationApplied,
+        start/stop election timers when membership changes, append the stable
+        entry after a joint entry commits (on the leader), and make a removed
+        leader step down once the stable configuration is committed."""
+        st = self.state[name]
+        config = entry["config"]
+        old, new = self._config_groups(config)
+        self._record({
+            "type": "configurationApplied",
+            "node": name,
+            "index": entry["index"],
+            "term": entry["term"],
+            "id": entry["id"],
+            "entryType": entry["entryType"],
+            "config": config,
+            "action": entry["action"],
+            "member": entry["member"],
+        })
+        if entry["entryType"] == CONFIG_STABLE:
+            # A stable entry keeps the new set in both halves, so the removed
+            # members come from the preceding joint configuration (old set)
+            # rather than from this entry itself.
+            prior_old, _prior_new = self._config_groups(
+                st.config_at(entry["index"], self.initial_config)
+            )
+            removed = prior_old - new
+            result = self.change_results.get(entry["id"])
+            if result is not None and result.get("outcome") != "committed":
+                result["outcome"] = "committed"
+                result["index"] = entry["index"]
+                result["term"] = entry["term"]
+                result.pop("jointPhase", None)
+            # A leader removed by the change it proposed steps down at once;
+            # its latest configuration no longer contains it, so it neither
+            # campaigns nor votes afterwards.
+            if name in removed and st.role == ROLE_LEADER:
+                self._leader_removed(name, entry)
+        else:
+            result = self.change_results.get(entry["id"])
+            if result is not None:
+                result["jointPhase"] = {"id": entry["id"], "old": sorted(old), "new": sorted(new)}
+            if st.role == ROLE_LEADER and not self._has_following_stable(st, entry):
+                # The joint configuration is committed (or, for a leader that
+                # won after the joint entry was already on both majorities, is
+                # being caught up): append the stable configuration. A new
+                # leader may already have appended one in _become_leader, in
+                # which case it must not be duplicated.
+                stable = self._stable_config(new)
+                self._append_config_entry(
+                    name, entry["id"], CONFIG_STABLE, stable, entry["action"], entry["member"]
+                )
+                for peer in self.node_names:
+                    if peer != name:
+                        self._replicate_to(name, peer)
+
+    def _leader_removed(self, name: str, entry: dict) -> None:
+        st = self.state[name]
+        st.role = ROLE_FOLLOWER
+        st.known_leader = None
+        st.votes = set()
+        st.next_index = {}
+        st.match_index = {}
+        # _reset_timeout cancels the timer for a now non-voting node.
+        self._reset_timeout(name)
+        self._record_state_change(name, "removedFromCluster")
+
     def _create_snapshot(self, name: str) -> None:
         """Fold every applied entry through last_applied into the snapshot and
         delete the compacted prefix. Global indices are preserved: the
         surviving log suffix keeps its indices and commitIndex/lastApplied are
-        not renumbered."""
+        not renumbered. The configuration in force at the snapshot index is
+        folded in as well, so membership survives compaction."""
         st = self.state[name]
         target = st.last_applied
         cut = target - st.snapshot_index
         included_term = st.log[cut - 1]["term"]
+        config = st.snapshot_config if st.snapshot_config else self.initial_config
+        for offset in range(cut):
+            entry = st.log[offset]
+            if entry.get("kind") == KIND_CONFIG:
+                config = entry["config"]
         st.snapshot_index = target
         st.snapshot_term = included_term
+        st.snapshot_config = self._store_config(config)
         del st.log[:cut]
         self._record({
             "type": "snapshotCreated",
@@ -1128,6 +1806,10 @@ class _Simulator:
     def _on_timeout(self, name: str, generation: int) -> None:
         st = self.state[name]
         if not st.online or generation != st.timeout_gen or st.role == ROLE_LEADER:
+            return
+        if not self._can_vote(name):
+            # A learner's or removed member's stray timer must never start an
+            # election.
             return
         self._record({"type": "timeout", "node": name, "term": st.term, "reason": "electionTimeout"})
         self._start_election(name)
@@ -1175,9 +1857,10 @@ class _Simulator:
     # -- report ---------------------------------------------------------------
 
     def _entry_view(self, st: _Node, index: int) -> dict | None:
-        """The (term, id, command) a node holds for a global log index, looking
-        through snapshot boundaries: applied entries cover the compacted prefix
-        and the uncompacted log covers everything after it."""
+        """The (term, id, ...) a node holds for a global log index, looking
+        through snapshot boundaries: applied entries cover the compacted
+        prefix and the uncompacted log covers everything after it. Both
+        client-command and configuration entries are covered."""
         if index <= 0 or index > st.last_log_index():
             return None
         if index <= st.last_applied:
@@ -1187,22 +1870,42 @@ class _Simulator:
         return None
 
     def _log_matching_violations(self) -> list[dict]:
-        """Same index and term, but different content (id/command) across nodes,
-        including indices folded into snapshots."""
+        """Same index and term, but different content (id/command for client
+        commands, or the configuration payload) across nodes, including
+        indices folded into snapshots or occupied by configuration entries."""
         violations = []
         max_len = max((st.last_log_index() for st in self.state.values()), default=0)
         for index in range(1, max_len + 1):
-            by_term: dict[int, dict[str, dict]] = {}
+            by_term: dict[int, dict[tuple, dict]] = {}
             for name in self.node_names:
                 st = self.state[name]
                 entry = self._entry_view(st, index)
                 if entry is None:
                     continue
-                marker = json.dumps([entry["id"], entry["command"]], ensure_ascii=False, sort_keys=True)
-                bucket = by_term.setdefault(
-                    entry["term"],
-                    {},
-                ).setdefault(marker, {"id": entry["id"], "command": entry["command"], "nodes": []})
+                if entry.get("kind") == KIND_CONFIG:
+                    marker = json.dumps(
+                        [
+                            entry["id"],
+                            KIND_CONFIG,
+                            entry["entryType"],
+                            entry.get("config"),
+                            entry.get("action"),
+                            entry.get("member"),
+                        ],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    bucket_view = {
+                        "id": entry["id"],
+                        "kind": KIND_CONFIG,
+                        "entryType": entry["entryType"],
+                        "config": entry.get("config"),
+                        "nodes": [],
+                    }
+                else:
+                    marker = json.dumps([entry["id"], entry["command"]], ensure_ascii=False, sort_keys=True)
+                    bucket_view = {"id": entry["id"], "command": entry["command"], "nodes": []}
+                bucket = by_term.setdefault(entry["term"], {}).setdefault(marker, bucket_view)
                 bucket["nodes"].append(name)
             for term, variants in sorted(by_term.items()):
                 if len(variants) > 1:
@@ -1216,7 +1919,9 @@ class _Simulator:
         return violations
 
     def _state_machine_safety_violations(self) -> list[dict]:
-        """Different nodes applied different commands at the same index."""
+        """Different nodes applied different entries at the same index.
+        Configuration entries participate in index alignment alongside client
+        commands, and applied histories recovered from snapshots are covered."""
         violations = []
         max_applied = max((st.last_applied for st in self.state.values()), default=0)
         for index in range(1, max_applied + 1):
@@ -1226,10 +1931,34 @@ class _Simulator:
                 if index > st.last_applied:
                     continue
                 entry = st.applied[index - 1]
-                marker = json.dumps([entry["term"], entry["id"], entry["command"]], ensure_ascii=False, sort_keys=True)
-                bucket = variants.setdefault(
-                    marker, {"term": entry["term"], "id": entry["id"], "command": entry["command"], "nodes": []}
-                )
+                if entry.get("kind") == KIND_CONFIG:
+                    marker = json.dumps(
+                        [
+                            entry["term"],
+                            entry["id"],
+                            KIND_CONFIG,
+                            entry["entryType"],
+                            entry.get("config"),
+                        ],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    bucket = variants.setdefault(
+                        marker,
+                        {
+                            "term": entry["term"],
+                            "id": entry["id"],
+                            "kind": KIND_CONFIG,
+                            "entryType": entry["entryType"],
+                            "config": entry.get("config"),
+                            "nodes": [],
+                        },
+                    )
+                else:
+                    marker = json.dumps([entry["term"], entry["id"], entry["command"]], ensure_ascii=False, sort_keys=True)
+                    bucket = variants.setdefault(
+                        marker, {"term": entry["term"], "id": entry["id"], "command": entry["command"], "nodes": []}
+                    )
                 bucket["nodes"].append(name)
             if len(variants) > 1:
                 violations.append(
@@ -1297,7 +2026,7 @@ class _Simulator:
                 grouped["superseded"].append({"id": command_id, "node": command["node"]})
         return grouped
 
-    def _node_report(self, st: _Node) -> dict:
+    def _node_report(self, name: str, st: _Node) -> dict:
         report = {
             "role": st.role,
             "term": st.term,
@@ -1308,6 +2037,12 @@ class _Simulator:
             "lastApplied": st.last_applied,
             "applied": [dict(entry) for entry in st.applied],
         }
+        if self.membership_enabled:
+            # Voter/learner according to the node's newest configuration,
+            # which governs voting and campaigning even before it commits.
+            report["membershipRole"] = (
+                "voter" if self._is_voter(name, st.latest_config(self.initial_config)) else "learner"
+            )
         if self.snapshot_threshold is not None:
             if st.snapshot_index > 0:
                 report["snapshot"] = {
@@ -1321,6 +2056,110 @@ class _Simulator:
             report["restartCount"] = st.restart_count
         return report
 
+    def _membership_report(self) -> dict:
+        # The reference node deterministically has the greatest committed
+        # position, then the greatest log length (declared node order breaks
+        # ties): committed truth dominates, so a deposed leader's stale
+        # uncommitted suffix cannot describe a phase the cluster left.
+        ref_name = max(
+            self.node_names,
+            key=lambda name: (
+                self.state[name].commit_index,
+                self.state[name].last_log_index(),
+                -self.index[name],
+            ),
+        )
+        ref = self.state[ref_name]
+        committed = ref.committed_config(self.initial_config)
+        latest = ref.latest_config(self.initial_config)
+
+        if latest.get("type") == CONFIG_JOINT:
+            old, new = self._config_groups(latest)
+            current_stable = sorted(old)
+            joint = {"id": self._latest_joint_id(ref),
+                     "old": sorted(old), "new": sorted(new)}
+        elif committed.get("type") == CONFIG_JOINT:
+            old, new = self._config_groups(committed)
+            current_stable = sorted(old)
+            joint = {"id": self._latest_joint_id(ref),
+                     "old": sorted(old), "new": sorted(new)}
+        else:
+            _, stable_voters = self._config_groups(committed)
+            current_stable = sorted(stable_voters)
+            joint = None
+
+        joint_ids = set()
+        for st in self.state.values():
+            for applied in st.applied:
+                if applied.get("kind") == KIND_CONFIG and applied["entryType"] == CONFIG_JOINT:
+                    joint_ids.add(applied["id"])
+            for log_entry in st.log:
+                if log_entry.get("kind") == KIND_CONFIG and log_entry["entryType"] == CONFIG_JOINT:
+                    joint_ids.add(log_entry["id"])
+
+        changes = []
+        for change in self.changes:
+            change_id = change["id"]
+            result = self.change_results.get(change_id)
+            entry = {
+                "id": change_id,
+                "node": change["node"],
+                "action": change["action"],
+                "member": change["member"],
+            }
+            if result is None or result.get("outcome") == "pending":
+                entry["outcome"] = "pending"
+                if self.pending_catchup is not None and self.pending_catchup["id"] == change_id:
+                    entry["phase"] = "catchingUp"
+                elif change_id in joint_ids:
+                    phase_info = result.get("jointPhase") if result else None
+                    entry["phase"] = "joint"
+                    if phase_info is not None:
+                        entry["joint"] = {
+                            "old": sorted(phase_info["old"]),
+                            "new": sorted(phase_info["new"]),
+                        }
+                else:
+                    entry["phase"] = "catchingUp"
+            elif result.get("outcome") == "rejected":
+                entry["outcome"] = "rejected"
+                entry["reason"] = result["reason"]
+            else:
+                entry["outcome"] = "committed"
+                entry["index"] = result["index"]
+                entry["term"] = result["term"]
+            changes.append(entry)
+
+        return {
+            "initial": sorted(self.initial_config["new"]),
+            "current": current_stable,
+            "joint": joint,
+            "changes": changes,
+        }
+
+    def _latest_config_entry_id(self, st: _Node, entry_type: str) -> str | None:
+        """The id of the newest committed configuration entry of a type,
+        looking through the snapshot into the applied history."""
+        found = None
+        for entry in st.applied:
+            if entry.get("kind") == KIND_CONFIG and entry["entryType"] == entry_type:
+                found = entry["id"]
+        upper = min(st.commit_index, st.last_log_index())
+        for i in range(st.snapshot_index + 1, upper + 1):
+            entry = st.log[i - 1 - st.snapshot_index]
+            if entry.get("kind") == KIND_CONFIG and entry["entryType"] == entry_type:
+                found = entry["id"]
+        return found
+
+    def _latest_joint_id(self, st: _Node) -> str | None:
+        """The id of the newest joint configuration entry the reference node
+        holds, including one appended but not yet committed."""
+        found = self._latest_config_entry_id(st, CONFIG_JOINT)
+        for entry in st.log:
+            if entry.get("kind") == KIND_CONFIG and entry["entryType"] == CONFIG_JOINT:
+                found = entry["id"]
+        return found
+
     def _report(self) -> dict:
         leaders = {str(term): names for term, names in sorted(self.leaders_by_term.items())}
         violations = [
@@ -1328,10 +2167,10 @@ class _Simulator:
             for term, names in sorted(self.leaders_by_term.items())
             if len(names) > 1
         ]
-        return {
+        report = {
             "timeline": self.timeline,
             "nodes": {
-                name: self._node_report(st)
+                name: self._node_report(name, st)
                 for name, st in self.state.items()
             },
             "clients": self._clients_report(),
@@ -1342,6 +2181,9 @@ class _Simulator:
             "logMatching": {"violations": self._log_matching_violations()},
             "stateMachineSafety": {"violations": self._state_machine_safety_violations()},
         }
+        if self.membership_enabled:
+            report["membership"] = self._membership_report()
+        return report
 
 
 def run_simulation(raw: object) -> dict:
