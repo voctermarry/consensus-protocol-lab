@@ -33,6 +33,10 @@ _KIND_MEMBERSHIP = 5
 _KIND_READ = 6
 _KIND_TIMEOUT = 7
 _KIND_HEARTBEAT = 8
+# Liveness checks are evaluated after every pre-existing event (and its
+# zero-delay reaction cascade) sharing the timestamp has drained, so this is
+# the largest event kind.
+_KIND_LIVENESS = 9
 
 _TOP_LEVEL_FIELDS = {
     "nodes",
@@ -48,6 +52,7 @@ _TOP_LEVEL_FIELDS = {
     "membershipChanges",
     "messageFaults",
     "readQueries",
+    "livenessChecks",
 }
 _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "faults",
@@ -58,6 +63,7 @@ _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "membershipChanges",
     "messageFaults",
     "readQueries",
+    "livenessChecks",
 }
 _FAULT_FIELDS = {"time", "action", "groups"}
 _MESSAGE_FAULT_FIELDS = {"from", "to", "message", "occurrence", "action", "delay"}
@@ -77,6 +83,18 @@ _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 _NODE_EVENT_FIELDS = {"time", "node", "action"}
 _MEMBERSHIP_CHANGE_FIELDS = {"time", "node", "id", "action", "member"}
 _READ_QUERY_FIELDS = {"time", "node", "id"}
+_LIVENESS_CHECK_FIELDS = {"id", "type", "startTime", "deadline", "target"}
+_LIVENESS_TYPES = (
+    "leaderElected",
+    "clientCommitted",
+    "readCompleted",
+    "membershipCommitted",
+)
+_LIVENESS_TARGET_TYPES = {
+    "clientCommitted": "clientCommands",
+    "readCompleted": "readQueries",
+    "membershipCommitted": "membershipChanges",
+}
 
 # Log-entry kinds: ordinary client commands versus replicated configuration
 # entries created by joint-consensus membership changes.
@@ -455,6 +473,74 @@ def parse_scenario(raw: object) -> dict:
         seen_read_ids.add(query_id)
         normalized_read_queries.append({"time": time, "node": node, "id": query_id})
 
+    liveness_provided = "livenessChecks" in raw
+    liveness_checks = raw.get("livenessChecks", [])
+    if not isinstance(liveness_checks, list):
+        raise ScenarioError("livenessChecks must be a list")
+    normalized_liveness_checks = []
+    seen_check_ids: set[str] = set()
+    for index, check in enumerate(liveness_checks):
+        label = f"livenessChecks[{index}]"
+        if not isinstance(check, dict):
+            raise ScenarioError(f"{label} must be an object")
+        unknown = sorted(set(check) - _LIVENESS_CHECK_FIELDS)
+        if unknown:
+            raise ScenarioError(f"{label} has unknown field(s): {', '.join(unknown)}")
+        missing = sorted(_LIVENESS_CHECK_FIELDS - {"target"} - set(check))
+        if missing:
+            raise ScenarioError(f"{label} missing field(s): {', '.join(missing)}")
+        check_id = check["id"]
+        if not isinstance(check_id, str) or not check_id:
+            raise ScenarioError(f"{label}.id must be a non-empty string")
+        if check_id in seen_check_ids:
+            raise ScenarioError(f"{label}.id duplicates a previous id: {check_id!r}")
+        seen_check_ids.add(check_id)
+        check_type = check["type"]
+        if check_type not in _LIVENESS_TYPES:
+            raise ScenarioError(
+                f"{label}.type must be one of: {', '.join(_LIVENESS_TYPES)}"
+            )
+        start_time = _require_int(check["startTime"], f"{label}.startTime", 0)
+        if start_time > duration:
+            raise ScenarioError(f"{label}.startTime is beyond the simulation duration")
+        deadline = _require_int(check["deadline"], f"{label}.deadline", 0)
+        if deadline > duration:
+            raise ScenarioError(f"{label}.deadline is beyond the simulation duration")
+        if start_time > deadline:
+            raise ScenarioError(f"{label}.startTime must not be greater than deadline")
+        if check_type == "leaderElected":
+            if "target" in check:
+                raise ScenarioError(f"{label} leaderElected must not have a target")
+            target = None
+        else:
+            if "target" not in check:
+                raise ScenarioError(f"{label} {check_type} requires a target")
+            target = check["target"]
+            if not isinstance(target, str) or not target:
+                raise ScenarioError(f"{label}.target must be a non-empty string")
+            container = _LIVENESS_TARGET_TYPES[check_type]
+            if container == "clientCommands" and target not in seen_ids:
+                raise ScenarioError(
+                    f"{label}.target references an unknown clientCommands id: {target!r}"
+                )
+            if container == "readQueries" and target not in seen_read_ids:
+                raise ScenarioError(
+                    f"{label}.target references an unknown readQueries id: {target!r}"
+                )
+            if container == "membershipChanges" and target not in seen_change_ids:
+                raise ScenarioError(
+                    f"{label}.target references an unknown membershipChanges id: {target!r}"
+                )
+        normalized_liveness_checks.append(
+            {
+                "id": check_id,
+                "type": check_type,
+                "startTime": start_time,
+                "deadline": deadline,
+                "target": target,
+            }
+        )
+
     return {
         "nodes": list(nodes),
         "duration": duration,
@@ -472,6 +558,8 @@ def parse_scenario(raw: object) -> dict:
         "membershipChanges": normalized_changes if has_initial_members else None,
         "readQueries": normalized_read_queries,
         "readQueriesProvided": read_queries_provided,
+        "livenessChecks": normalized_liveness_checks,
+        "livenessChecksProvided": liveness_provided,
     }
 
 
@@ -655,6 +743,24 @@ class _Simulator:
         self.read_required: dict[str, set[str]] = {}
         # Client-command ids committed so far (leader-side commit advances).
         self.committed_command_ids: set[str] = set()
+        # Client-command ids accepted (appended to a leader's log) at least
+        # once; together with the rejected map and current log presence this
+        # distinguishes "not submitted yet / pending" from "superseded".
+        self.accepted_command_ids: set[str] = set()
+        # Optional liveness checks. Each one is evaluated at every virtual
+        # timestamp in its [startTime, deadline] window, but only after all
+        # pre-existing events sharing that timestamp (and their zero-delay
+        # reaction cascades) have drained; checks at the same timestamp run in
+        # input order.
+        self.liveness_checks: list[dict] = config["livenessChecks"]
+        self.liveness_provided: bool = config["livenessChecksProvided"]
+        # check id -> finished result entry (status satisfied/failed).
+        self.liveness_results: dict[str, dict] = {}
+        # Whether an online leader exists at the current evaluation point.
+        self.leader_online = False
+        # change id -> virtual time its stable configuration entry was first
+        # applied on any node (the moment the change is committed).
+        self.stable_commit_times: dict[str, int] = {}
 
     def run(self) -> dict:
         for order, fault in enumerate(self.faults):
@@ -670,6 +776,17 @@ class _Simulator:
         for name in self.node_names:
             if self._is_voter(name, self.initial_config):
                 heapq.heappush(self.queue, (self.timeouts[name], _KIND_TIMEOUT, self.index[name], (name, 0)))
+        if self.liveness_provided:
+            # Anchors at every window edge guarantee evaluation also runs at
+            # timestamps carrying no pre-existing events; all other timestamps
+            # are reached via the drain hook in the loop below.
+            anchors = sorted({
+                edge
+                for check in self.liveness_checks
+                for edge in (check["startTime"], check["deadline"])
+            })
+            for order, edge in enumerate(anchors):
+                heapq.heappush(self.queue, (edge, _KIND_LIVENESS, order, None))
         while self.queue:
             time, kind, _order, payload = heapq.heappop(self.queue)
             if time > self.duration:
@@ -690,8 +807,18 @@ class _Simulator:
                 self._on_read_query(payload)
             elif kind == _KIND_TIMEOUT:
                 self._on_timeout(*payload)
-            else:
+            elif kind == _KIND_HEARTBEAT:
                 self._on_heartbeat(*payload)
+            # The liveness anchor itself is a no-op: it only marks a window
+            # edge that carries no other events. Either way, once no entry
+            # remains for the current timestamp (its zero-delay reactions
+            # included), the timestamp has fully drained and the checks run.
+            if (
+                self.liveness_provided
+                and self.liveness_checks
+                and (not self.queue or self.queue[0][0] > self.now)
+            ):
+                self._evaluate_liveness(self.now)
         return self._report()
 
     # -- timeline helpers -------------------------------------------------
@@ -1885,6 +2012,7 @@ class _Simulator:
 
         index = st.last_log_index() + 1
         st.log.append(self._command_entry(index, st.term, command_id, command["command"]))
+        self.accepted_command_ids.add(command_id)
         self._record({
             "type": "clientResult",
             "node": node,
@@ -2181,6 +2309,9 @@ class _Simulator:
                 result["index"] = entry["index"]
                 result["term"] = entry["term"]
                 result.pop("jointPhase", None)
+            # The first application of the stable entry is the moment the
+            # change commits; later nodes applying it must not move the time.
+            self.stable_commit_times.setdefault(entry["id"], self.now)
             # A leader removed by the change it proposed steps down at once;
             # its latest configuration no longer contains it, so it neither
             # campaigns nor votes afterwards.
@@ -2296,6 +2427,100 @@ class _Simulator:
         else:
             self.partition = None
             self._record({"type": "fault", "action": "heal"})
+
+    # -- liveness checks -------------------------------------------------------
+
+    def _has_online_leader(self) -> bool:
+        return any(
+            st.online and st.role == ROLE_LEADER for st in self.state.values()
+        )
+
+    def _command_present_anywhere(self, command_id: str) -> bool:
+        """Whether an accepted command still survives in some node's applied
+        history or uncompacted log suffix."""
+        for st in self.state.values():
+            if any(entry.get("id") == command_id for entry in st.applied):
+                return True
+            if any(entry.get("id") == command_id for entry in st.log):
+                return True
+        return False
+
+    def _liveness_satisfied(self, check: dict) -> bool:
+        check_type = check["type"]
+        target = check["target"]
+        if check_type == "leaderElected":
+            return self.leader_online
+        if check_type == "clientCommitted":
+            return target in self.committed_command_ids
+        if check_type == "readCompleted":
+            result = self.read_results.get(target)
+            return result is not None and result.get("outcome") == "completed"
+        # membershipCommitted: the stable configuration entry has been applied
+        # (the change committed).
+        return target in self.stable_commit_times
+
+    def _liveness_failure_reason(self, check: dict) -> str | None:
+        """A terminal reason once the target can never satisfy the check;
+        None while satisfaction is still possible."""
+        check_type = check["type"]
+        target = check["target"]
+        if check_type == "clientCommitted":
+            if target in self.rejected:
+                return "targetRejected"
+            if (
+                target in self.accepted_command_ids
+                and target not in self.committed_command_ids
+                and not self._command_present_anywhere(target)
+            ):
+                # Accepted earlier, but its uncommitted entry was truncated by
+                # a higher-term leader: it can never commit anymore.
+                return "targetSuperseded"
+            return None
+        if check_type == "readCompleted":
+            result = self.read_results.get(target)
+            if result is not None and result.get("outcome") == "rejected":
+                return "targetRejected"
+            return None
+        if check_type == "membershipCommitted":
+            result = self.change_results.get(target)
+            if result is not None and result.get("outcome") == "rejected":
+                return "targetRejected"
+            return None
+        return None
+
+    def _evaluate_liveness(self, time: int) -> None:
+        """Run every open check whose window contains this timestamp, in
+        input order, against the fully drained state at ``time``."""
+        self.leader_online = self._has_online_leader()
+        for check in self.liveness_checks:
+            check_id = check["id"]
+            if check_id in self.liveness_results:
+                continue
+            if time < check["startTime"] or time > check["deadline"]:
+                continue
+            result = {"id": check_id, "checkType": check["type"]}
+            if check["target"] is not None:
+                result["target"] = check["target"]
+            if not self._liveness_satisfied(check):
+                if time < check["deadline"]:
+                    # The first satisfying moment may still arrive later in
+                    # the window; a terminal target failure likewise surfaces
+                    # as the reason at the deadline.
+                    continue
+                result["status"] = "failed"
+                result["time"] = time
+                result["reason"] = self._liveness_failure_reason(check) or "deadlineExceeded"
+            else:
+                result["status"] = "satisfied"
+                result["time"] = time
+            self.liveness_results[check_id] = result
+            entry = {"type": "livenessResult", "id": check_id, "checkType": result["checkType"]}
+            if check["target"] is not None:
+                entry["target"] = check["target"]
+            entry["status"] = result["status"]
+            if result["status"] == "failed":
+                entry["reason"] = result["reason"]
+            self._record(entry)
 
     # -- report ---------------------------------------------------------------
 
@@ -2653,6 +2878,13 @@ class _Simulator:
                 )
         return violations
 
+    def _liveness_report(self) -> dict:
+        """Per-check outcomes in input order; every failed outcome is also
+        listed as a violation."""
+        checks = [self.liveness_results[check["id"]] for check in self.liveness_checks]
+        violations = [check for check in checks if check["status"] == "failed"]
+        return {"checks": checks, "violations": violations}
+
     def _report(self) -> dict:
         leaders = {str(term): names for term, names in sorted(self.leaders_by_term.items())}
         violations = [
@@ -2682,6 +2914,8 @@ class _Simulator:
             }
         if self.membership_enabled:
             report["membership"] = self._membership_report()
+        if self.liveness_provided:
+            report["liveness"] = self._liveness_report()
         return report
 
 

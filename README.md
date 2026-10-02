@@ -2,7 +2,7 @@
 
 本项目是「分布式共识协议实验平台」的代码仓库，用于逐步实现该方向的共识流程仿真、故障注入与不变量校验能力。
 
-当前已实现确定性的 Raft 选主与日志复制仿真（含快照与日志压缩、联合共识成员变更、只读查询与线性一致性检查）：只推进虚拟时间，不读取墙钟、不使用随机数，同一输入产生逐字节一致的输出。
+当前已实现确定性的 Raft 选主与日志复制仿真（含快照与日志压缩、联合共识成员变更、只读查询与线性一致性检查、基于虚拟时间的可选活性检查）：只推进虚拟时间，不读取墙钟、不使用随机数，同一输入产生逐字节一致的输出。
 
 ## 环境与安装
 
@@ -67,6 +67,12 @@ consensus-protocol-lab --help               # 打印用法
 - `readQueries`（可选）：只读查询列表，同一时刻在故障、节点事件、已到达消息、客户命令及其零延迟反应之后按输入顺序受理，再处理超时与心跳。每项包含：
   - `time`：`[0, duration]` 内的非负整数虚拟时间；`node`：接收查询的已有节点名（非空字符串）；`id`：非空字符串，与客户命令、成员变更和其他查询的 id 全局唯一。
   - 省略该字段时，不新增 `readResult` 事件、`readProbe`/`readReply` 消息、`reads` 汇总与 `linearizability` 报告，既有合法场景输出逐字节不变。
+- `livenessChecks`（可选）：活性检查列表，用虚拟时间验证进展。每项包含：
+  - `id`：非空字符串，在检查列表内唯一。
+  - `type`：`leaderElected`、`clientCommitted`、`readCompleted` 或 `membershipCommitted`。
+  - `startTime`、`deadline`：均为 `[0, duration]` 内的非负整数虚拟时间，且 `startTime` 不大于 `deadline`。
+  - `target`：`clientCommitted`、`readCompleted`、`membershipCommitted` 分别必须引用一个已有的 `clientCommands`、`readQueries`、`membershipChanges` 的 id（非空字符串）；`leaderElected` 禁止携带该字段。
+  - 省略该字段时，不新增任何事件或顶层字段，既有合法场景输出逐字节不变。
 
 ### 语义
 
@@ -97,6 +103,9 @@ consensus-protocol-lab --help               # 打印用法
   - leader 受理查询时先记录 `accepted`，`readIndex` 取当时的 `commitIndex`（leader 已提交并应用的位置），随后向每个节点发送携带查询 id 的 `readProbe`；收到 `readProbe` 的节点在任期不劣于对方时确认并回复携带查询 id 的 `readReply`，否则拒绝并携带自己的任期。两类消息服从既有延迟、`messageFaults`（`message` 接受 `readProbe` 与 `readReply`）、分区、乱序与离线规则。
   - 只有在 leader 身份与任期未变、且就受理时记录的配置取得有效多数确认时查询才完成：稳定配置取投票集合的严格多数，联合阶段取新旧两个集合各自的严格多数，learner 不计入（leader 自身计入其所属集合）。无后续写入时，只要 leader 与多数持续可达，查询也会凭 `readProbe`/`readReply` 完成。
   - leader 下线、退位或任期改变时，其未完成的查询结局为 `rejected`/`leadershipLost`；仿真结束时仍未取得同一任期和有效配置多数的查询为 `pending`。不同轮次的回复凭查询 id 与任期匹配，不得混用。
+- 提供 `livenessChecks` 后，检查在闭区间 `[startTime, deadline]` 内寻找首次满足时刻：每个虚拟时刻先处理完既有事件及其零延迟反应，再按检查的输入顺序评估。若条件在此前已经完成且在 `startTime` 仍成立，结果时间取 `startTime`。
+  - `leaderElected` 以当时存在在线 leader 为准；`clientCommitted` 以命令已提交为准；`readCompleted` 以查询已完成（`completed`）为准；`membershipCommitted` 以稳定配置项已提交为准。
+  - 满足时在 timeline 追加 `livenessResult`；到 `deadline` 仍未满足时记为失败：目标命令已拒绝或已被覆盖分别给出 `targetRejected`、`targetSuperseded`，目标查询或成员变更已拒绝给出 `targetRejected`，其余为 `deadlineExceeded`。失败不改变退出码，也不停止仿真。
 
 ### 输出
 
@@ -116,6 +125,7 @@ consensus-protocol-lab --help               # 打印用法
   - `membershipResult`：成员变更请求结果。`accepted`（add 且尚未追加联合项时含 `phase: "catchingUp"`）或 `rejected`（含 `reason`，取值 `nodeDown`/`notLeader`/`changeInProgress`/`alreadyMember`/`notMember`/`minimumClusterSize`），仅在提供成员变更字段时出现。
   - `configurationApplied`：节点按索引应用一个已提交配置项（含 `index`、`term`、`id`、`entryType` 为 `joint`/`stable`、`config`、`action`、`member`），仅在提供成员变更字段时出现。
   - 复制配置项的 `appendEntries` 消息结果另含 `configEntries`（每项含 `index`、`id`、`entryType`），与客户命令复制明确区分。
+  - `livenessResult`：活性检查的最终结果，位于同刻全部既有事件（含零延迟反应）之后（仅在提供 `livenessChecks` 时出现）。含检查 `id`、`checkType`（检查类型，取值同输入 `type`）、`status` 为 `satisfied`/`failed`；带 target 的检查另含 `target`，失败另含 `reason`（`targetRejected`/`targetSuperseded`/`deadlineExceeded`）。结果发生时刻由外层 `time` 给出。
 - `nodes`：各节点最终的 `role`、`term`、`votedFor`、`knownLeader`，以及 `log`（仅含未压缩后缀，仍带全局 `index`/`term`/`id`/`command`；启用成员变更时客户命令条目含 `kind: "command"`，配置项含 `kind: "config"`、`entryType`、`config`、`action`、`member`）、`commitIndex`、`lastApplied`、`applied`（同样以 `kind` 区分两类条目）；提供 `snapshotThreshold` 时另含 `snapshot`（`{"lastIncludedIndex", "lastIncludedTerm"}`，未创建快照时为 `null`）；提供 `nodeEvents` 时另含 `online` 与 `restartCount`；提供成员变更字段时另含 `membershipRole`（按该节点最新配置取 `voter` 或 `learner`）。
 - `membership`（仅在提供成员变更字段时出现）：
   - `initial`：初始投票集合；`current`：当前已提交的稳定投票集合（联合阶段仍为旧稳定集合）；`joint`：联合阶段为 `{"id", "old", "new"}`，否则为 `null`。
@@ -131,14 +141,15 @@ consensus-protocol-lab --help               # 打印用法
   - `rejected`：`nodeDown`（`knownLeader` 为 `null`）、`notLeader` 或 `leadershipLost`，含 `reason`、`knownLeader`。
   - `pending`：仿真结束时仍未取得多数确认（含 `term`、`readIndex`）。
 - `linearizability`（仅在提供 `readQueries` 时出现）：`violations` 按查询输入顺序检查每个已完成的读：结果不是 `readIndex` 对应的完整命令前缀时记 `nonPrefix`；遗漏查询受理前已提交的写入时记 `staleRead`（含 `missing` 列出遗漏的命令 id）。
+- `liveness`（仅在提供 `livenessChecks` 时出现）：`checks` 按输入顺序汇总每项检查的结果（含 `id`、`checkType`、`status`、结果 `time`，带 target 的类型另含 `target`，失败另含 `reason`）；`violations` 包含全部 `failed` 结果。
 - `logMatching`：`violations` 列出“同索引同任期但内容（客户命令的 id/command，或配置项负载）不同”的情况；跨配置项与快照边界检查（已压缩索引取自已应用历史）。
 - `stateMachineSafety`：`violations` 列出不同节点在同一索引应用了不同条目的情况（配置项与客户命令一并参与索引对齐，并跨快照边界检查）。
 
-未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息；未同时提供 `initialMembers` 与 `membershipChanges` 时，不新增 `membership` 汇总、`membershipRole`、成员事件与配置项标记；未提供 `messageFaults` 时，不新增 `messageFault` 事件与 `messageFault` 原因的丢弃结果，既有合法场景的输出逐字节不变。
+未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息；未同时提供 `initialMembers` 与 `membershipChanges` 时，不新增 `membership` 汇总、`membershipRole`、成员事件与配置项标记；未提供 `messageFaults` 时，不新增 `messageFault` 事件与 `messageFault` 原因的丢弃结果；未提供 `livenessChecks` 时，不新增 `livenessResult` 事件与 `liveness` 顶层字段，既有合法场景的输出逐字节不变。
 
 ### 错误
 
-文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复、`readQueries` 非列表或条目的字段缺失/未知、时间越界、节点未知、id 非法或与客户命令/成员变更/其他查询的 id 重复时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复、`readQueries` 非列表或条目的字段缺失/未知、时间越界、节点未知、id 非法或与客户命令/成员变更/其他查询的 id 重复、`livenessChecks` 非列表或条目的字段缺失/未知、`id` 非空且唯一、`type` 非法、时间越界或 `startTime` 大于 `deadline`、`leaderElected` 携带 target、其他类型缺失 target、target 不是非空字符串或引用了不存在的客户命令/查询/成员变更 id 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
 ## 现有公开接口
 
