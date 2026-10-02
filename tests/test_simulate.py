@@ -771,3 +771,480 @@ def test_invalid_snapshot_threshold(tmp_path, capsys, value):
     assert out == ""
     assert err.startswith("error: ")
     assert err.count("\n") == 1
+
+
+# -- membership changes (joint consensus) -----------------------------------
+
+
+def _membership_scenario(**overrides):
+    scenario = {
+        "nodes": ["a", "b", "c", "d"],
+        "duration": 800,
+        "electionTimeouts": {"a": 100, "b": 150, "c": 200, "d": 250},
+        "heartbeatInterval": 50,
+        "messageDelay": 10,
+        "initialMembers": ["a", "b", "c"],
+        "membershipChanges": [
+            {"time": 200, "node": "a", "id": "add-d", "action": "add", "member": "d"},
+        ],
+    }
+    scenario.update(overrides)
+    return scenario
+
+
+def _config_entries(result, node):
+    node_report = result["nodes"][node]
+    return [
+        (e["index"], e["configuration"]["phase"])
+        for e in node_report["applied"]
+        if e.get("entryType") == "configuration"
+    ]
+
+
+def test_membership_fields_only_appear_when_enabled(tmp_path, capsys):
+    code, out, _ = _run(tmp_path, capsys, _base_scenario())
+    assert code == 0
+    result = json.loads(out)
+    assert "membership" not in result
+    for node in result["nodes"].values():
+        assert "membershipRole" not in node
+    assert not [e for e in result["timeline"] if e["type"] in (
+        "membershipResult", "configurationApplied"
+    )]
+
+
+def test_initial_learners_never_campaign_or_vote(tmp_path, capsys):
+    # d is a learner, even with the shortest timeout and even while isolated,
+    # it must never start an election or cast a vote.
+    code, out, _ = _run(
+        tmp_path,
+        capsys,
+        _membership_scenario(
+            duration=500,
+            membershipChanges=[],
+            electionTimeouts={"a": 100, "b": 150, "c": 200, "d": 80},
+            faults=[{"time": 0, "action": "partition", "groups": [["d"], ["a", "b", "c"]]}],
+        ),
+    )
+    assert code == 0
+    result = json.loads(out)
+    assert result["nodes"]["d"]["term"] == 0
+    assert result["nodes"]["d"]["role"] == "follower"
+    assert result["nodes"]["d"]["membershipRole"] == "learner"
+    assert not [
+        e for e in result["timeline"]
+        if e.get("node") == "d" and e["type"] in ("timeout", "stateChange")
+    ]
+    assert all(n["membershipRole"] == "voter" for n in (
+        result["nodes"]["a"], result["nodes"]["b"], result["nodes"]["c"]
+    ))
+    assert result["membership"] == {
+        "initialMembers": ["a", "b", "c"],
+        "currentMembers": ["a", "b", "c"],
+        "joint": None,
+        "changes": [],
+    }
+
+
+def test_add_member_joint_then_stable(tmp_path, capsys):
+    code, out, err = _run(tmp_path, capsys, _membership_scenario())
+    assert code == 0
+    assert err == ""
+    result = json.loads(out)
+
+    assert result["membership"]["currentMembers"] == ["a", "b", "c", "d"]
+    assert result["membership"]["joint"] is None
+    assert result["membership"]["changes"] == [
+        {
+            "id": "add-d",
+            "node": "a",
+            "action": "add",
+            "member": "d",
+            "outcome": "committed",
+            "jointIndex": 1,
+            "stableIndex": 2,
+        }
+    ]
+    # Every node applied the joint then the stable configuration, once each.
+    for node in ("a", "b", "c", "d"):
+        assert _config_entries(result, node) == [(1, "joint"), (2, "stable")]
+        assert result["nodes"][node]["membershipRole"] == "voter"
+
+    accepted = [
+        e for e in _by_type(result, "membershipResult") if e["result"] == "accepted"
+    ]
+    assert [(e["id"], e["action"], e["member"], e["phase"]) for e in accepted] == [
+        ("add-d", "add", "d", "catchup")
+    ]
+    phases = [
+        (e["node"], e["index"], e["phase"])
+        for e in _by_type(result, "configurationApplied")
+    ]
+    assert phases == [
+        ("a", 1, "joint"),
+        ("b", 1, "joint"),
+        ("c", 1, "joint"),
+        ("d", 1, "joint"),
+        ("a", 2, "stable"),
+        ("b", 2, "stable"),
+        ("c", 2, "stable"),
+        ("d", 2, "stable"),
+    ]
+    assert result["electionSafety"]["violations"] == []
+    assert result["logMatching"]["violations"] == []
+    assert result["stateMachineSafety"]["violations"] == []
+
+
+def test_config_entries_distinguishable_from_commands(tmp_path, capsys):
+    code, out, _ = _run(
+        tmp_path,
+        capsys,
+        _membership_scenario(
+            clientCommands=[
+                {"time": 300, "node": "a", "id": "x1", "command": "one"},
+            ]
+        ),
+    )
+    assert code == 0
+    result = json.loads(out)
+    for node in result["nodes"].values():
+        kinds = {}
+        for e in node["applied"]:
+            if e.get("entryType") == "configuration":
+                assert "command" not in e
+                kinds.setdefault("configuration", []).append(e["configuration"]["phase"])
+            else:
+                assert "configuration" not in e
+                kinds.setdefault("command", []).append(e["id"])
+        assert kinds["configuration"] == ["joint", "stable"]
+        assert kinds["command"] == ["x1"]
+    # Config entries never appear as client applied events.
+    assert [e["id"] for e in _by_type(result, "applied") if e["node"] == "a"] == ["x1"]
+
+
+def test_membership_rejection_reasons_in_order(tmp_path, capsys):
+    scenario = _membership_scenario(
+        duration=1200,
+        nodeEvents=[{"time": 250, "node": "b", "action": "crash"}],
+        membershipChanges=[
+            # While idle and leader, removing the learner d is notMember.
+            {"time": 150, "node": "a", "id": "notmember", "action": "remove", "member": "d"},
+            # A follower node is notLeader.
+            {"time": 180, "node": "c", "id": "notleader", "action": "add", "member": "d"},
+            # b crashes at 250; a request to it afterwards is nodeDown.
+            {"time": 300, "node": "b", "id": "down", "action": "add", "member": "d"},
+            # The valid addition starts a change that then blocks a second one.
+            {"time": 340, "node": "a", "id": "add-d", "action": "add", "member": "d"},
+            {"time": 350, "node": "a", "id": "busy", "action": "remove", "member": "b"},
+            # Once d is a voter, adding it again is alreadyMember.
+            {"time": 700, "node": "a", "id": "already", "action": "add", "member": "d"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    rejected = {
+        e["id"]: e["reason"]
+        for e in _by_type(result, "membershipResult")
+        if e["result"] == "rejected"
+    }
+    assert rejected == {
+        "notmember": "notMember",
+        "notleader": "notLeader",
+        "down": "nodeDown",
+        "busy": "changeInProgress",
+        "already": "alreadyMember",
+    }
+    outcomes = {c["id"]: c["outcome"] for c in result["membership"]["changes"]}
+    assert outcomes["add-d"] == "committed"
+    for rejected_id in ("notmember", "notleader", "down", "busy", "already"):
+        assert outcomes[rejected_id] == "rejected"
+
+
+def test_minimum_cluster_size_rejects_removal(tmp_path, capsys):
+    # Start with four voters (add d first, then try to shrink below three).
+    scenario = _membership_scenario(
+        duration=1200,
+        membershipChanges=[
+            {"time": 200, "node": "a", "id": "add-d", "action": "add", "member": "d"},
+            {"time": 700, "node": "a", "id": "rm-b", "action": "remove", "member": "b"},
+            {"time": 900, "node": "a", "id": "rm-c", "action": "remove", "member": "c"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    rejected = {
+        e["id"]: e["reason"]
+        for e in _by_type(result, "membershipResult")
+        if e["result"] == "rejected"
+    }
+    assert rejected == {"rm-c": "minimumClusterSize"}
+    assert result["membership"]["currentMembers"] == ["a", "c", "d"]
+
+
+def test_remove_leader_steps_down_immediately(tmp_path, capsys):
+    scenario = _membership_scenario(
+        duration=1500,
+        membershipChanges=[
+            {"time": 200, "node": "a", "id": "add-d", "action": "add", "member": "d"},
+            {"time": 500, "node": "a", "id": "rm-a", "action": "remove", "member": "a"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    stepdown = [
+        e for e in result["timeline"]
+        if e["type"] == "stateChange" and e["reason"] == "configurationCommitted"
+    ]
+    assert [(e["node"], e["role"]) for e in stepdown] == [("a", "follower")]
+    assert result["nodes"]["a"]["role"] == "follower"
+    assert result["nodes"]["a"]["membershipRole"] == "learner"
+    assert result["membership"]["currentMembers"] == ["b", "c", "d"]
+    # A new leader is elected from the remaining voters, never a.
+    assert "a" not in result["electionSafety"]["leadersByTerm"].get("2", [])
+    # a never campaigns after being removed.
+    assert not [
+        e for e in result["timeline"]
+        if e.get("node") == "a" and e["type"] == "stateChange" and e["role"] == "candidate"
+        and e["time"] >= stepdown[0]["time"]
+    ]
+
+
+def test_joint_quorum_required_for_election_and_commit(tmp_path, capsys):
+    # Joint consensus over {a,b,c} and {a,b,c,d}: partition d away together
+    # with one old voter so neither set can form its own majority; no leader
+    # may be elected and the joint entry may not commit.
+    scenario = _membership_scenario(
+        duration=700,
+        faults=[{"time": 205, "action": "partition", "groups": [["a"], ["b", "c", "d"]]}],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    # The joint entry cannot get a majority of the old set {a,b,c} on a alone,
+    # so it stays uncommitted and the change is pending at simulation end.
+    outcomes = {c["id"]: c for c in result["membership"]["changes"]}
+    assert outcomes["add-d"]["outcome"] == "pending"
+    # No two leaders in one term: joint majority must gate elections too.
+    assert result["electionSafety"]["violations"] == []
+
+
+def test_new_leader_completes_change_after_crash(tmp_path, capsys):
+    scenario = _membership_scenario(
+        duration=1500,
+        faults=[
+            {"time": 280, "action": "partition", "groups": [["a"], ["b", "c", "d"]]},
+            {"time": 1000, "action": "heal"},
+        ],
+        nodeEvents=[
+            {"time": 290, "node": "a", "action": "crash"},
+            {"time": 1100, "node": "a", "action": "restart"},
+        ],
+        clientCommands=[
+            {"time": 800, "node": "b", "id": "z1", "command": "go"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    assert result["membership"]["currentMembers"] == ["a", "b", "c", "d"]
+    assert result["membership"]["joint"] is None
+    assert result["membership"]["changes"][0]["outcome"] == "committed"
+    # The configuration is applied at most once per node per entry: no
+    # duplicate application after leadership change.
+    for node in ("a", "b", "c", "d"):
+        applied = [
+            e for e in _by_type(result, "configurationApplied") if e["node"] == node
+        ]
+        indices = [(e["index"], e["phase"]) for e in applied]
+        assert sorted(indices) == sorted(set(indices))
+    assert result["logMatching"]["violations"] == []
+    assert result["stateMachineSafety"]["violations"] == []
+
+
+def test_membership_survives_snapshot_and_restart(tmp_path, capsys):
+    scenario = _membership_scenario(
+        duration=1500,
+        snapshotThreshold=4,
+        nodeEvents=[
+            {"time": 600, "node": "d", "action": "crash"},
+            {"time": 900, "node": "d", "action": "restart"},
+        ],
+        clientCommands=[
+            {"time": 300, "node": "a", "id": "x1", "command": 1},
+            {"time": 310, "node": "a", "id": "x2", "command": 2},
+        ],
+        membershipChanges=[
+            {"time": 200, "node": "a", "id": "add-d", "action": "add", "member": "d"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    node_d = result["nodes"]["d"]
+    assert node_d["membershipRole"] == "voter"
+    assert node_d["snapshot"]["lastIncludedIndex"] >= 2
+    # Restored configuration entries are not applied twice as events.
+    applied_d = [
+        (e["index"], e["phase"])
+        for e in _by_type(result, "configurationApplied") if e["node"] == "d"
+    ]
+    assert sorted(applied_d) == sorted(set(applied_d))
+    assert result["membership"]["changes"][0]["outcome"] == "committed"
+
+
+def test_learner_catches_up_via_snapshot_install(tmp_path, capsys):
+    scenario = _membership_scenario(
+        duration=1000,
+        snapshotThreshold=3,
+        faults=[
+            {"time": 0, "action": "partition", "groups": [["d"], ["a", "b", "c"]]},
+            {"time": 350, "action": "heal"},
+        ],
+        clientCommands=[
+            {"time": 200, "node": "a", "id": "x1", "command": "one"},
+            {"time": 210, "node": "a", "id": "x2", "command": "two"},
+            {"time": 220, "node": "a", "id": "x3", "command": "three"},
+            {"time": 230, "node": "a", "id": "x4", "command": "four"},
+        ],
+        membershipChanges=[
+            {"time": 500, "node": "a", "id": "add-d", "action": "add", "member": "d"},
+        ],
+    )
+    code, out, _ = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    result = json.loads(out)
+    installed = _by_type(result, "snapshotInstalled")
+    assert [(e["node"], e["peer"]) for e in installed] == [("d", "a")]
+    node_d = result["nodes"]["d"]
+    assert node_d["membershipRole"] == "voter"
+    assert [e["id"] for e in node_d["applied"]] == [
+        "x1", "x2", "x3", "x4", "add-d", "add-d"
+    ]
+    # Snapshot contents restore silently: only the suffix command emits an
+    # applied event, and the two config entries each apply once.
+    applied_events = [
+        (e["index"], e["id"]) for e in _by_type(result, "applied") if e["node"] == "d"
+    ]
+    assert applied_events == [(4, "x4")]
+    cfg_d = [
+        (e["index"], e["phase"])
+        for e in _by_type(result, "configurationApplied") if e["node"] == "d"
+    ]
+    assert cfg_d == [(5, "joint"), (6, "stable")]
+    assert result["membership"]["changes"][0]["outcome"] == "committed"
+
+
+def test_membership_output_is_deterministic(tmp_path, capsys):
+    scenario = _membership_scenario(
+        duration=1500,
+        snapshotThreshold=3,
+        faults=[{"time": 400, "action": "partition", "groups": [["a", "b"], ["c", "d"]]}],
+        nodeEvents=[
+            {"time": 300, "node": "b", "action": "crash"},
+            {"time": 700, "node": "b", "action": "restart"},
+        ],
+    )
+    _, out1, _ = _run(tmp_path, capsys, scenario)
+    _, out2, _ = _run(tmp_path, capsys, scenario)
+    assert out1 == out2
+    parsed = json.loads(out1)
+    seqs = [e["seq"] for e in parsed["timeline"]]
+    assert seqs == list(range(1, len(seqs) + 1))
+
+
+def test_config_replication_recorded_on_append_results(tmp_path, capsys):
+    code, out, _ = _run(tmp_path, capsys, _membership_scenario())
+    assert code == 0
+    result = json.loads(out)
+    carrying = [
+        e for e in _by_type(result, "messageResult")
+        if e["message"] == "appendEntries" and e.get("configurations")
+    ]
+    assert carrying
+    for event in carrying:
+        for carried in event["configurations"]:
+            assert carried["phase"] in ("joint", "stable")
+            assert "id" in carried
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda s: s.pop("membershipChanges"),
+    lambda s: s.pop("initialMembers"),
+    lambda s: s.update(initialMembers="abc"),
+    lambda s: s.update(initialMembers=["a", "b"]),
+    lambda s: s.update(initialMembers=["a", "b", "z"]),
+    lambda s: s.update(initialMembers=["a", "b", "b"]),
+    lambda s: s.update(initialMembers=["a", ""]),
+    lambda s: s.update(membershipChanges="x"),
+    lambda s: s.update(membershipChanges=[1]),
+    lambda s: s.update(membershipChanges=[{"time": 1}]),
+    lambda s: s.update(membershipChanges=[
+        {"time": 1, "node": "a", "id": "m1", "action": "add", "member": "d", "extra": 1}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": "1", "node": "a", "id": "m1", "action": "add", "member": "d"}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": -1, "node": "a", "id": "m1", "action": "add", "member": "d"}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": 9999, "node": "a", "id": "m1", "action": "add", "member": "d"}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": 1, "node": "z", "id": "m1", "action": "add", "member": "d"}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": 1, "node": "", "id": "m1", "action": "add", "member": "d"}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": 1, "node": "a", "id": "m1", "action": "frobnicate", "member": "d"}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": 1, "node": "a", "id": "m1", "action": "add", "member": "z"}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": 1, "node": "a", "id": "m1", "action": "add", "member": ""}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": 1, "node": "a", "id": "", "action": "add", "member": "d"}
+    ]),
+    lambda s: s.update(membershipChanges=[
+        {"time": 1, "node": "a", "id": "m1", "action": "add", "member": "d"},
+        {"time": 2, "node": "a", "id": "m1", "action": "remove", "member": "d"},
+    ]),
+])
+def test_invalid_membership_scenarios(tmp_path, capsys, mutate):
+    scenario = _base_scenario(
+        nodes=["a", "b", "c", "d"],
+        electionTimeouts={"a": 100, "b": 150, "c": 200, "d": 250},
+        initialMembers=["a", "b", "c"],
+        membershipChanges=[],
+    )
+    mutate(scenario)
+    code, out, err = _run(tmp_path, capsys, scenario)
+    assert code == 2
+    assert out == ""
+    assert err.startswith("error: ")
+    assert err.count("\n") == 1
+
+
+def test_membership_id_duplicates_client_id(tmp_path, capsys):
+    scenario = _base_scenario(
+        nodes=["a", "b", "c", "d"],
+        electionTimeouts={"a": 100, "b": 150, "c": 200, "d": 250},
+        initialMembers=["a", "b", "c"],
+        membershipChanges=[
+            {"time": 10, "node": "a", "id": "shared", "action": "add", "member": "d"}
+        ],
+        clientCommands=[
+            {"time": 20, "node": "a", "id": "shared", "command": 1}
+        ],
+    )
+    code, out, err = _run(tmp_path, capsys, scenario)
+    assert code == 2
+    assert out == ""
+    assert err.startswith("error: ")
+    assert err.count("\n") == 1
