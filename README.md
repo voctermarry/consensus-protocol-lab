@@ -43,6 +43,13 @@ consensus-protocol-lab --help               # 打印用法
   - `{"time": t, "action": "partition", "groups": [[...], [...]]}`：两个分组互不重叠、各自非空并覆盖全部节点；组间消息在投递时丢弃。
   - `{"time": t, "action": "heal"}`：恢复全连通。
   - `time` 必须在 `[0, duration]` 范围内。
+- `messageFaults`（可选）：消息级故障规则列表，精确命中某一次发送。每项包含：
+  - `from`、`to`：两个不同的已有节点名（非空字符串）。
+  - `message`：`requestVote`、`voteReply`、`heartbeat`、`appendEntries`、`appendReply`、`installSnapshot`、`installSnapshotReply` 之一。
+  - `occurrence`：正整数，按 `(from, to, message)` 相同的选择器从仿真开始对实际发送计数，命中第几次发送。
+  - `action`：`drop` 或 `delay`。`drop` 不得携带 `delay` 字段；`delay` 必须携带非负整数 `delay`，实际到达时刻为发送时刻加 `messageDelay` 再加该值。
+  - 完整选择器 `(from, to, message, occurrence)` 不得重复；未匹配到任何发送的规则不报错、不产生输出。
+  - 省略该字段（或为空列表、或规则均未命中）时，合法旧场景的标准输出逐字节不变。
 - `clientCommands`（可选）：客户命令列表，同一时刻先处理故障与已到达消息，再按输入顺序处理客户命令，最后处理超时与心跳。每项包含：
   - `time`：`[0, duration]` 内的非负整数虚拟时间。
   - `node`：接收命令的已有节点名（非空字符串）。
@@ -68,6 +75,7 @@ consensus-protocol-lab --help               # 打印用法
 - follower 仅在前一索引处任期匹配（前缀匹配）时接受 appendEntries；冲突时删除冲突位置及其后缀，再追加；否则回复拒绝，leader 将该节点的下一索引确定性地回退一位并重试。
 - 当某索引的条目（其任期须为 leader 当前任期）被包含 leader 自身的严格多数节点复制后，leader 才推进 `commitIndex`；节点按索引顺序应用已提交条目。后续有效复制（含心跳携带的 leaderCommit）使 follower 更新提交位置并应用。
 - 同一时刻依次处理故障、nodeEvents、消息、客户命令及其零延迟复制级联、超时、心跳；同刻事件按 `nodes` 顺序，timeline 以全局递增 `seq` 记录。
+- `messageFaults` 规则命中某次发送时，仍先记录原有的 `messageSend`，随后在同一时刻记录 `messageFault`；`drop` 规则的消息在原计划到达时刻（发送时刻加 `messageDelay`）记录 `result: "dropped"`、`reason: "messageFault"` 的 `messageResult`，不执行任何接收逻辑；`delay` 规则的消息改在实际到达时刻（原计划到达时刻再加规则的 `delay`）按原语义处理，目标是否在线、链路是否分区均在到达时判断，因此 `nodeDown` 或 `partition` 仍可决定最终结果，延后也可能使消息乱序到达。到达时刻超过 `duration` 时只保留发送与 `messageFault` 记录；同刻到达的消息继续按全局发送顺序处理。
 - 节点在线时，任期、投票、日志、`commitIndex`、`lastApplied` 与 `applied` 的每次变化都在相关响应之前同步持久化（leader 接受命令前先持久化日志）；持久化不读取墙钟、不使用随机数。
 - `crash` 后节点离线：不发送或处理任何消息，不触发选举超时、心跳或客户命令；发往离线节点的消息在到达时记为 `dropped`/`nodeDown`，而崩溃前已发出的消息仍按原时间投递。发给离线节点的客户命令记为 `rejected`/`nodeDown`，`knownLeader` 为 `null`。
 - `restart` 恢复持久化状态（`term`、`votedFor`、`log`、快照、`commitIndex`、`lastApplied`、`applied`），以 follower、`knownLeader` 为 `null` 上线，清空候选票与 leader 复制进度，选举超时从重启时刻重新计算；已恢复的条目不会重复应用。
@@ -87,6 +95,7 @@ consensus-protocol-lab --help               # 打印用法
 成功时标准输出只写一个 JSON 对象：
 
 - `timeline`：按 `seq` 递增的事件列表。除原有的 `timeout`、`stateChange`、`messageSend`、`messageResult`、`fault` 外，新增：
+  - `messageFault`：一条 `messageFaults` 规则命中某次发送（含 `rule` 规则在输入列表中的序号、`from`、`to`、`message`、`occurrence`、`action`、`scheduledTime` 原计划到达时刻；`delay` 规则另含 `arrivalTime` 实际到达时刻），仅在提供 `messageFaults` 且规则命中时出现。
   - `clientResult`：`accepted`（含 `index`、`term`）或 `rejected`（含 `reason: notLeader`、`knownLeader`）。
   - 复制消息 `appendEntries`/`appendReply` 的发送与 `messageResult`（`accepted`、`conflict`、`staleTerm`、`matched`、`higherTerm`、`ignored` 等）。
   - `commitAdvance`：leader 推进 `commitIndex`。
@@ -111,11 +120,11 @@ consensus-protocol-lab --help               # 打印用法
 - `logMatching`：`violations` 列出“同索引同任期但内容（客户命令的 id/command，或配置项负载）不同”的情况；跨配置项与快照边界检查（已压缩索引取自已应用历史）。
 - `stateMachineSafety`：`violations` 列出不同节点在同一索引应用了不同条目的情况（配置项与客户命令一并参与索引对齐，并跨快照边界检查）。
 
-未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息；未同时提供 `initialMembers` 与 `membershipChanges` 时，不新增 `membership` 汇总、`membershipRole`、成员事件与配置项标记，既有合法场景的输出逐字节不变。
+未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息；未同时提供 `initialMembers` 与 `membershipChanges` 时，不新增 `membership` 汇总、`membershipRole`、成员事件与配置项标记；未提供 `messageFaults` 时，不新增 `messageFault` 事件与 `messageFault` 原因的丢弃结果，既有合法场景的输出逐字节不变。
 
 ### 错误
 
-文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
 ## 现有公开接口
 

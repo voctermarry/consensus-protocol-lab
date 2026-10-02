@@ -41,6 +41,7 @@ _TOP_LEVEL_FIELDS = {
     "snapshotThreshold",
     "initialMembers",
     "membershipChanges",
+    "messageFaults",
 }
 _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "faults",
@@ -49,8 +50,20 @@ _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "snapshotThreshold",
     "initialMembers",
     "membershipChanges",
+    "messageFaults",
 }
 _FAULT_FIELDS = {"time", "action", "groups"}
+_MESSAGE_FAULT_FIELDS = {"from", "to", "message", "occurrence", "action", "delay"}
+_MESSAGE_FAULT_REQUIRED = {"from", "to", "message", "occurrence", "action"}
+_MESSAGE_KINDS = (
+    "requestVote",
+    "voteReply",
+    "heartbeat",
+    "appendEntries",
+    "appendReply",
+    "installSnapshot",
+    "installSnapshotReply",
+)
 _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 _NODE_EVENT_FIELDS = {"time", "node", "action"}
 _MEMBERSHIP_CHANGE_FIELDS = {"time", "node", "id", "action", "member"}
@@ -171,6 +184,68 @@ def parse_scenario(raw: object) -> dict:
             normalized_faults.append({"time": time, "action": "heal"})
         else:
             raise ScenarioError(f"{label}.action must be partition or heal")
+
+    message_faults = raw.get("messageFaults", [])
+    if not isinstance(message_faults, list):
+        raise ScenarioError("messageFaults must be a list")
+    normalized_message_faults = []
+    seen_selectors: dict[tuple, int] = {}
+    for index, message_fault in enumerate(message_faults):
+        label = f"messageFaults[{index}]"
+        if not isinstance(message_fault, dict):
+            raise ScenarioError(f"{label} must be an object")
+        unknown = sorted(set(message_fault) - _MESSAGE_FAULT_FIELDS)
+        if unknown:
+            raise ScenarioError(f"{label} has unknown field(s): {', '.join(unknown)}")
+        missing = sorted(_MESSAGE_FAULT_REQUIRED - set(message_fault))
+        if missing:
+            raise ScenarioError(f"{label} missing field(s): {', '.join(missing)}")
+        src = message_fault["from"]
+        if not isinstance(src, str) or not src:
+            raise ScenarioError(f"{label}.from must be a non-empty string")
+        if src not in node_set:
+            raise ScenarioError(f"{label}.from references unknown node: {src!r}")
+        dst = message_fault["to"]
+        if not isinstance(dst, str) or not dst:
+            raise ScenarioError(f"{label}.to must be a non-empty string")
+        if dst not in node_set:
+            raise ScenarioError(f"{label}.to references unknown node: {dst!r}")
+        if src == dst:
+            raise ScenarioError(f"{label}.from and {label}.to must be different nodes")
+        kind = message_fault["message"]
+        if kind not in _MESSAGE_KINDS:
+            raise ScenarioError(
+                f"{label}.message must be one of: {', '.join(_MESSAGE_KINDS)}"
+            )
+        occurrence = _require_int(message_fault["occurrence"], f"{label}.occurrence", 1)
+        action = message_fault["action"]
+        if action not in ("drop", "delay"):
+            raise ScenarioError(f"{label}.action must be drop or delay")
+        extra_delay = None
+        if action == "drop":
+            if "delay" in message_fault:
+                raise ScenarioError(f"{label} drop must not have delay")
+        else:
+            if "delay" not in message_fault:
+                raise ScenarioError(f"{label} delay requires delay")
+            extra_delay = _require_int(message_fault["delay"], f"{label}.delay", 0)
+        selector = (src, dst, kind, occurrence)
+        if selector in seen_selectors:
+            raise ScenarioError(
+                f"{label} duplicates the selector of messageFaults[{seen_selectors[selector]}]"
+            )
+        seen_selectors[selector] = index
+        normalized = {
+            "index": index,
+            "from": src,
+            "to": dst,
+            "message": kind,
+            "occurrence": occurrence,
+            "action": action,
+        }
+        if extra_delay is not None:
+            normalized["delay"] = extra_delay
+        normalized_message_faults.append(normalized)
 
     commands = raw.get("clientCommands", [])
     if not isinstance(commands, list):
@@ -337,6 +412,7 @@ def parse_scenario(raw: object) -> dict:
         "heartbeatInterval": heartbeat,
         "messageDelay": delay,
         "faults": normalized_faults,
+        "messageFaults": normalized_message_faults,
         "clientCommands": normalized_commands,
         "nodeEvents": normalized_node_events,
         "nodeEventsProvided": node_events_provided,
@@ -462,6 +538,14 @@ class _Simulator:
         self.heartbeat_interval: int = config["heartbeatInterval"]
         self.delay: int = config["messageDelay"]
         self.faults: list[dict] = config["faults"]
+        # Per-message fault rules, keyed by the full selector
+        # (from, to, message, occurrence); the per-(from, to, message) send
+        # counter below numbers actual sends from the start of the run.
+        self.message_faults: dict[tuple, dict] = {
+            (rule["from"], rule["to"], rule["message"], rule["occurrence"]): rule
+            for rule in config["messageFaults"]
+        }
+        self.message_fault_counts: dict[tuple, int] = {}
         self.commands: list[dict] = config["clientCommands"]
         self.node_events: list[dict] = config["nodeEvents"]
         self.node_events_provided: bool = config["nodeEventsProvided"]
@@ -769,13 +853,41 @@ class _Simulator:
         self._record({"type": "messageSend", "node": src, "peer": dst, "message": msg["kind"], "term": msg["term"]})
         self.send_counter += 1
         envelope = {**msg, "src": src, "dst": dst}
+        # A messageFaults rule matches the occurrence-th actual send of its
+        # (from, to, message) selector. The fault is recorded right after the
+        # send; a drop replaces delivery with a dropped/messageFault result at
+        # the originally scheduled arrival, a delay shifts the arrival itself.
+        count_key = (src, dst, msg["kind"])
+        occurrence = self.message_fault_counts.get(count_key, 0) + 1
+        self.message_fault_counts[count_key] = occurrence
+        rule = self.message_faults.get((src, dst, msg["kind"], occurrence))
+        extra_delay = 0
+        if rule is not None:
+            scheduled = self.now + self.delay
+            fault_entry = {
+                "type": "messageFault",
+                "rule": rule["index"],
+                "from": src,
+                "to": dst,
+                "message": msg["kind"],
+                "occurrence": occurrence,
+                "action": rule["action"],
+                "scheduledTime": scheduled,
+            }
+            if rule["action"] == "drop":
+                envelope["faultDrop"] = True
+            else:
+                extra_delay = rule["delay"]
+                fault_entry["arrivalTime"] = scheduled + extra_delay
+            self._record(fault_entry)
+        effective_delay = self.delay + extra_delay
         # Zero-delay replication triggered while draining a client-command
         # batch shares the batch's timestamp and must follow the remaining
         # client commands; a positive delay lands strictly in the future and
         # queues as a normal message arrival.
-        in_phase = self.reaction_phase and self.delay == 0
+        in_phase = self.reaction_phase and effective_delay == 0
         kind = _KIND_REACTION if in_phase else _KIND_MESSAGE
-        heapq.heappush(self.queue, (self.now + self.delay, kind, self.send_counter, envelope))
+        heapq.heappush(self.queue, (self.now + effective_delay, kind, self.send_counter, envelope))
 
     def _send_heartbeats(self, name: str) -> None:
         """Per peer, send either a log-carrying appendEntries (when the peer is
@@ -844,6 +956,19 @@ class _Simulator:
 
     def _deliver(self, msg: dict) -> None:
         src, dst = msg["src"], msg["dst"]
+        if msg.get("faultDrop"):
+            # A messageFaults drop rule: the message never reaches the
+            # receiver, reported at its originally scheduled arrival time.
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": msg["kind"],
+                "term": msg["term"],
+                "result": "dropped",
+                "reason": "messageFault",
+            })
+            return
         if not self.state[dst].online:
             # The destination crashed after this message was sent; it is
             # dropped on arrival. Messages the crashed node itself sent
