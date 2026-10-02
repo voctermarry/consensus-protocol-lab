@@ -33,6 +33,9 @@ _KIND_MEMBERSHIP = 5
 _KIND_READ = 6
 _KIND_TIMEOUT = 7
 _KIND_HEARTBEAT = 8
+# Liveness checks are evaluated after every existing event kind sharing a
+# timestamp (and the zero-delay reactions those events enqueue) has drained.
+_KIND_LIVENESS = 9
 
 _TOP_LEVEL_FIELDS = {
     "nodes",
@@ -48,6 +51,7 @@ _TOP_LEVEL_FIELDS = {
     "membershipChanges",
     "messageFaults",
     "readQueries",
+    "livenessChecks",
 }
 _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "faults",
@@ -58,6 +62,7 @@ _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "membershipChanges",
     "messageFaults",
     "readQueries",
+    "livenessChecks",
 }
 _FAULT_FIELDS = {"time", "action", "groups"}
 _MESSAGE_FAULT_FIELDS = {"from", "to", "message", "occurrence", "action", "delay"}
@@ -77,6 +82,9 @@ _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 _NODE_EVENT_FIELDS = {"time", "node", "action"}
 _MEMBERSHIP_CHANGE_FIELDS = {"time", "node", "id", "action", "member"}
 _READ_QUERY_FIELDS = {"time", "node", "id"}
+_LIVENESS_CHECK_FIELDS = {"id", "type", "startTime", "deadline", "target"}
+_LIVENESS_TARGET_TYPES = ("clientCommitted", "readCompleted", "membershipCommitted")
+_LIVENESS_CHECK_TYPES = ("leaderElected",) + _LIVENESS_TARGET_TYPES
 
 # Log-entry kinds: ordinary client commands versus replicated configuration
 # entries created by joint-consensus membership changes.
@@ -455,6 +463,74 @@ def parse_scenario(raw: object) -> dict:
         seen_read_ids.add(query_id)
         normalized_read_queries.append({"time": time, "node": node, "id": query_id})
 
+    liveness_provided = "livenessChecks" in raw
+    liveness_checks = raw.get("livenessChecks", [])
+    if not isinstance(liveness_checks, list):
+        raise ScenarioError("livenessChecks must be a list")
+    normalized_liveness_checks = []
+    seen_liveness_ids: set[str] = set()
+    command_ids = {command["id"] for command in normalized_commands}
+    read_ids = {query["id"] for query in normalized_read_queries}
+    change_ids = set(seen_change_ids)
+    liveness_fields_without_target = _LIVENESS_CHECK_FIELDS - {"target"}
+    for index, check in enumerate(liveness_checks):
+        label = f"livenessChecks[{index}]"
+        if not isinstance(check, dict):
+            raise ScenarioError(f"{label} must be an object")
+        if "id" not in check or "type" not in check or "startTime" not in check or "deadline" not in check:
+            raise ScenarioError(
+                f"{label} must have id, type, startTime and deadline"
+            )
+        check_id = check["id"]
+        if not isinstance(check_id, str) or not check_id:
+            raise ScenarioError(f"{label}.id must be a non-empty string")
+        if check_id in seen_liveness_ids:
+            raise ScenarioError(f"{label}.id duplicates a previous id: {check_id!r}")
+        seen_liveness_ids.add(check_id)
+        check_type = check["type"]
+        if check_type not in _LIVENESS_CHECK_TYPES:
+            raise ScenarioError(
+                f"{label}.type must be one of: {', '.join(_LIVENESS_CHECK_TYPES)}"
+            )
+        allowed_fields = (
+            liveness_fields_without_target
+            if check_type == "leaderElected"
+            else _LIVENESS_CHECK_FIELDS
+        )
+        unknown = sorted(set(check) - allowed_fields)
+        if unknown:
+            raise ScenarioError(f"{label} has unknown field(s): {', '.join(unknown)}")
+        missing = sorted(allowed_fields - set(check))
+        if missing:
+            raise ScenarioError(f"{label} missing field(s): {', '.join(missing)}")
+        start = _require_int(check["startTime"], f"{label}.startTime", 0)
+        if start > duration:
+            raise ScenarioError(f"{label}.startTime is beyond the simulation duration")
+        deadline = _require_int(check["deadline"], f"{label}.deadline", 0)
+        if deadline > duration:
+            raise ScenarioError(f"{label}.deadline is beyond the simulation duration")
+        if start > deadline:
+            raise ScenarioError(f"{label}.startTime must not be greater than deadline")
+        target = None
+        if check_type != "leaderElected":
+            target = check["target"]
+            if not isinstance(target, str) or not target:
+                raise ScenarioError(f"{label}.target must be a non-empty string")
+            if check_type == "clientCommitted":
+                pool, pool_name = command_ids, "clientCommands"
+            elif check_type == "readCompleted":
+                pool, pool_name = read_ids, "readQueries"
+            else:
+                pool, pool_name = change_ids, "membershipChanges"
+            if target not in pool:
+                raise ScenarioError(
+                    f"{label}.target references an unknown {pool_name} id: {target!r}"
+                )
+        normalized_liveness_checks.append(
+            {"id": check_id, "type": check_type, "startTime": start, "deadline": deadline,
+             "target": target}
+        )
+
     return {
         "nodes": list(nodes),
         "duration": duration,
@@ -472,6 +548,8 @@ def parse_scenario(raw: object) -> dict:
         "membershipChanges": normalized_changes if has_initial_members else None,
         "readQueries": normalized_read_queries,
         "readQueriesProvided": read_queries_provided,
+        "livenessChecks": normalized_liveness_checks,
+        "livenessChecksProvided": liveness_provided,
     }
 
 
@@ -655,6 +733,25 @@ class _Simulator:
         self.read_required: dict[str, set[str]] = {}
         # Client-command ids committed so far (leader-side commit advances).
         self.committed_command_ids: set[str] = set()
+        # Optional liveness checks. The run records the first virtual time at
+        # which each predicate holds inside its window; the supporting maps
+        # pin those moments down precisely even though checks are evaluated
+        # once per timestamp (after that timestamp's events and zero-delay
+        # reactions drained).
+        self.liveness_checks: list[dict] = config["livenessChecks"]
+        self.liveness_provided: bool = config["livenessChecksProvided"]
+        self.liveness_results: dict[str, dict] = {}
+        # command id -> first time its commit advanced on a leader.
+        self.command_commit_time: dict[str, int] = {}
+        # read query id -> first time it completed.
+        self.read_completion_time: dict[str, int] = {}
+        # membership change id -> first time its stable config was committed.
+        self.change_commit_time: dict[str, int] = {}
+        # Liveness check-points are queued at most once per timestamp: one
+        # kind-9 entry drains after every same-time event and every zero-delay
+        # reaction they enqueue, regardless of which transition requested it.
+        self.liveness_checkpoint_times: set[int] = set()
+        self.liveness_order = 0
 
     def run(self) -> dict:
         for order, fault in enumerate(self.faults):
@@ -670,6 +767,11 @@ class _Simulator:
         for name in self.node_names:
             if self._is_voter(name, self.initial_config):
                 heapq.heappush(self.queue, (self.timeouts[name], _KIND_TIMEOUT, self.index[name], (name, 0)))
+        # A check-point at every window boundary covers both the
+        # "already held at startTime" satisfaction case and deadline failure.
+        for check in self.liveness_checks:
+            self._post_liveness_checkpoint(check["startTime"])
+            self._post_liveness_checkpoint(check["deadline"])
         while self.queue:
             time, kind, _order, payload = heapq.heappop(self.queue)
             if time > self.duration:
@@ -690,9 +792,96 @@ class _Simulator:
                 self._on_read_query(payload)
             elif kind == _KIND_TIMEOUT:
                 self._on_timeout(*payload)
+            elif kind == _KIND_LIVENESS:
+                self._evaluate_liveness_checks()
             else:
                 self._on_heartbeat(*payload)
         return self._report()
+
+    # -- liveness checks ------------------------------------------------------
+
+    def _post_liveness_checkpoint(self, time: int) -> None:
+        """Queue the single liveness evaluation point for ``time`` (a no-op
+        without livenessChecks, or when one is already queued for that time).
+        Kind 9 sorts behind every same-time event and zero-delay reaction."""
+        if not self.liveness_provided or time in self.liveness_checkpoint_times:
+            return
+        self.liveness_checkpoint_times.add(time)
+        self.liveness_order += 1
+        heapq.heappush(self.queue, (time, _KIND_LIVENESS, self.liveness_order, None))
+
+    def _liveness_holds(self, check: dict) -> bool:
+        """Whether the check's predicate is satisfied by the state at the
+        current (fully drained) timestamp."""
+        check_type = check["type"]
+        if check_type == "leaderElected":
+            return any(st.online and st.role == ROLE_LEADER for st in self.state.values())
+        if check_type == "clientCommitted":
+            return check["target"] in self.command_commit_time
+        if check_type == "readCompleted":
+            return check["target"] in self.read_completion_time
+        return check["target"] in self.change_commit_time
+
+    def _liveness_failure_reason(self, check: dict) -> str:
+        check_type = check["type"]
+        target = check["target"]
+        if check_type == "clientCommitted":
+            if target in self.rejected:
+                return "targetRejected"
+            # Accepted but uncommitted at the deadline: pending while some
+            # node still holds the entry, targetSuperseded once the
+            # higher-term truncation removed it from every log (mirroring the
+            # clients report's pending/superseded classification).
+            present = any(
+                entry.get("id") == target
+                for st in self.state.values()
+                for entry in st.log
+            )
+            return "deadlineExceeded" if present else "targetSuperseded"
+        if check_type == "readCompleted":
+            result = self.read_results.get(target)
+            if result is not None and result.get("outcome") == "rejected":
+                return "targetRejected"
+            return "deadlineExceeded"
+        if check_type == "membershipCommitted":
+            result = self.change_results.get(target)
+            if result is not None and result.get("outcome") == "rejected":
+                return "targetRejected"
+            return "deadlineExceeded"
+        return "deadlineExceeded"
+
+    def _evaluate_liveness_checks(self) -> None:
+        """Evaluate every still-open check in input order at this timestamp:
+        satisfy at the first post-drain instant its predicate holds inside
+        the window, otherwise fail exactly at the deadline."""
+        time = self.now
+        for check in self.liveness_checks:
+            check_id = check["id"]
+            if check_id in self.liveness_results:
+                continue
+            if time < check["startTime"]:
+                continue
+            if self._liveness_holds(check):
+                self._record_liveness_result(check, "satisfied", time)
+            elif time == check["deadline"]:
+                reason = self._liveness_failure_reason(check)
+                self._record_liveness_result(check, "failed", time, reason)
+
+    def _record_liveness_result(
+        self, check: dict, status: str, time: int, reason: str | None = None
+    ) -> None:
+        result = {"id": check["id"], "type": check["type"]}
+        if check["target"] is not None:
+            result["target"] = check["target"]
+        result["status"] = status
+        result["time"] = time
+        if reason is not None:
+            result["reason"] = reason
+        self.liveness_results[check["id"]] = result
+        # The appended livenessResult record carries id, the check's type,
+        # the optional target, status and time (seq is added by _record); the
+        # record is identifiable among timeline entries by its status field.
+        self._record(dict(result))
 
     # -- timeline helpers -------------------------------------------------
 
@@ -871,6 +1060,7 @@ class _Simulator:
         leaders = self.leaders_by_term.setdefault(st.term, [])
         if name not in leaders:
             leaders.append(name)
+        self._post_liveness_checkpoint(self.now)
         self._send_heartbeats(name)
         self._resume_membership_change(name)
 
@@ -1746,6 +1936,7 @@ class _Simulator:
             "readIndex": read_index,
             "state": state,
         }
+        self.read_completion_time.setdefault(query_id, self.now)
         self._record({
             "type": "readResult",
             "node": name,
@@ -1754,6 +1945,7 @@ class _Simulator:
             "term": read["term"],
             "readIndex": read_index,
         })
+        self._post_liveness_checkpoint(self.now)
 
     def _abandon_reads(self, name: str) -> None:
         """Fail every read still pending on a node that stopped being leader
@@ -2076,11 +2268,15 @@ class _Simulator:
             if self._replicated_by_majorities(name, candidate, config):
                 # Track the client commands this commit covers so that reads
                 # accepted later can be checked for staleness.
+                newly_committed: list[str] = []
                 for index in range(st.commit_index + 1, candidate + 1):
                     view = self._entry_view(st, index)
                     if view is not None and view.get("kind") != KIND_CONFIG:
                         self.committed_command_ids.add(view["id"])
+                        newly_committed.append(view["id"])
                 st.commit_index = candidate
+                for command_id in newly_committed:
+                    self.command_commit_time.setdefault(command_id, self.now)
                 self._record({
                     "type": "commitAdvance",
                     "node": name,
@@ -2088,6 +2284,8 @@ class _Simulator:
                     "commitIndex": st.commit_index,
                 })
                 self._advance_apply(name)
+                if newly_committed:
+                    self._post_liveness_checkpoint(self.now)
                 return
 
     def _advance_apply(self, name: str) -> None:
@@ -2181,6 +2379,10 @@ class _Simulator:
                 result["index"] = entry["index"]
                 result["term"] = entry["term"]
                 result.pop("jointPhase", None)
+            # The first node to apply the stable entry fixes the commit time
+            # used by membershipCommitted checks.
+            self.change_commit_time.setdefault(entry["id"], self.now)
+            self._post_liveness_checkpoint(self.now)
             # A leader removed by the change it proposed steps down at once;
             # its latest configuration no longer contains it, so it neither
             # campaigns nor votes afterwards.
@@ -2653,6 +2855,16 @@ class _Simulator:
                 )
         return violations
 
+    def _liveness_report(self) -> dict:
+        """Per-check outcomes in input order plus every failed result."""
+        checks = [self.liveness_results[check["id"]] for check in self.liveness_checks]
+        violations = [
+            dict(result)
+            for result in checks
+            if result["status"] == "failed"
+        ]
+        return {"checks": checks, "violations": violations}
+
     def _report(self) -> dict:
         leaders = {str(term): names for term, names in sorted(self.leaders_by_term.items())}
         violations = [
@@ -2682,6 +2894,8 @@ class _Simulator:
             }
         if self.membership_enabled:
             report["membership"] = self._membership_report()
+        if self.liveness_provided:
+            report["liveness"] = self._liveness_report()
         return report
 
 
