@@ -258,3 +258,143 @@ def test_simulate_and_version_are_unchanged(tmp_path, capsys):
     out, err = capsys.readouterr()
     assert code == 0 and err == ""
     assert out.strip() != ""
+
+
+def _liveness_plan(deadline, candidates, **overrides):
+    scenario = _base_scenario(
+        livenessChecks=[
+            {"id": "L1", "type": "leaderElected", "startTime": 0, "deadline": deadline}
+        ]
+    )
+    plan = _base_plan(scenario=scenario, candidates=candidates, **overrides)
+    return plan
+
+
+def test_minimize_failures_omitted_or_false_keeps_output_unchanged(tmp_path, capsys):
+    plan = _base_plan(candidates=[_candidate(1), _candidate(2)], maxFaults=2)
+    code1, out1, _ = _run(tmp_path, capsys, plan)
+    plan["minimizeFailures"] = False
+    code2, out2, _ = _run(tmp_path, capsys, plan)
+    assert code1 == code2 == 0
+    assert out1 == out2
+    summary = json.loads(out1)
+    for case in summary["cases"]:
+        assert "failureReports" not in case
+        assert "minimalSelected" not in case
+        assert "minimalCaseId" not in case
+
+
+def test_minimize_failures_must_be_a_boolean(tmp_path, capsys):
+    for bad in (1, 0, "true", None, [True]):
+        err = _run_error(tmp_path, capsys, _base_plan(minimizeFailures=bad))
+        assert "minimizeFailures must be a boolean" in err
+
+
+def test_minimize_shared_signature_points_at_no_fault_case(tmp_path, capsys):
+    # The liveness deadline expires before any election timeout, so every
+    # case fails with the same signature; the no-fault case is the minimal
+    # reproduction for all of them.
+    plan = _liveness_plan(
+        50,
+        [_candidate(91), _candidate(92)],
+        maxFaults=1,
+        minimizeFailures=True,
+    )
+    summary = _run_ok(tmp_path, capsys, plan)
+    assert summary["failedCases"] == 3
+    for case in summary["cases"]:
+        assert case["status"] == "failed"
+        assert case["failureReports"] == ["liveness"]
+        assert case["minimalSelected"] == []
+        assert case["minimalCaseId"] == 0
+
+
+def test_minimize_keeps_the_faults_needed_for_the_violation(tmp_path, capsys):
+    # Dropping a's first RequestVote to both peers delays the election past
+    # the deadline; either drop alone still lets a win, so only the pair
+    # fails and it is already minimal. maxCases equals the combination
+    # count: minimization references do not count against it.
+    plan = _liveness_plan(
+        120,
+        [
+            _candidate(1, message="requestVote", **{"from": "a", "to": "b"}),
+            _candidate(1, message="requestVote", **{"from": "a", "to": "c"}),
+        ],
+        maxFaults=2,
+        maxCases=4,
+        minimizeFailures=True,
+    )
+    summary = _run_ok(tmp_path, capsys, plan)
+    assert (summary["totalCases"], summary["passedCases"], summary["failedCases"]) == (4, 3, 1)
+    assert [case["caseId"] for case in summary["cases"]] == [0, 1, 2, 3]
+    assert [case["selected"] for case in summary["cases"]] == [[], [0], [1], [0, 1]]
+    for case in summary["cases"][:3]:
+        assert case["status"] == "passed"
+        assert "failureReports" not in case
+        assert "minimalSelected" not in case
+        assert "minimalCaseId" not in case
+    failed = summary["cases"][3]
+    assert failed["status"] == "failed"
+    assert failed["failureReports"] == ["liveness"]
+    assert failed["minimalSelected"] == [0, 1]
+    assert failed["minimalCaseId"] == 3
+
+
+def test_minimize_does_not_change_existing_fields(tmp_path, capsys):
+    plan = _liveness_plan(120, [_candidate(1), _candidate(2)], maxFaults=2)
+    plain = _run_ok(tmp_path, capsys, plan)
+    plan["minimizeFailures"] = True
+    minimized = _run_ok(tmp_path, capsys, plan)
+    for key in ("totalCases", "passedCases", "failedCases"):
+        assert plain[key] == minimized[key]
+    for before, after in zip(plain["cases"], minimized["cases"]):
+        for key in ("caseId", "selected", "status", "result"):
+            assert before[key] == after[key]
+
+
+def _synthetic_case(case_id, selected, reports):
+    # Reports are inserted in reverse priority order to prove that
+    # failureReports follows the fixed check priority, not dict order.
+    result = {
+        name: {"violations": ["v"]}
+        for name in reversed(reports)
+    }
+    return {
+        "caseId": case_id,
+        "selected": selected,
+        "status": "failed" if reports else "passed",
+        "result": result,
+    }
+
+
+def test_attach_minimization_signature_and_tie_breaking():
+    from consensus_lab.explore import _attach_minimization
+
+    cases = [
+        _synthetic_case(0, [], ["liveness"]),
+        _synthetic_case(1, [0], ["electionSafety", "liveness"]),
+        _synthetic_case(2, [1], []),
+        _synthetic_case(3, [0, 1], ["liveness", "electionSafety"]),
+    ]
+    _attach_minimization(cases)
+    # Check-priority order, not insertion order.
+    assert cases[1]["failureReports"] == ["electionSafety", "liveness"]
+    assert cases[3]["failureReports"] == ["electionSafety", "liveness"]
+    # Deleting rule 1 leaves case 1 with the same signature; deleting rule 0
+    # leaves a passed case and deleting both leaves only the other violation,
+    # so neither may be chosen.
+    assert cases[3]["minimalSelected"] == [0]
+    assert cases[3]["minimalCaseId"] == 1
+    assert "failureReports" not in cases[2]
+
+    tied = [
+        _synthetic_case(0, [], []),
+        _synthetic_case(1, [0], ["liveness"]),
+        _synthetic_case(2, [1], ["liveness"]),
+        _synthetic_case(3, [0, 1], ["liveness"]),
+    ]
+    _attach_minimization(tied)
+    # Fewest rules wins; equal sizes take the lexicographically smallest
+    # index list, and the passed no-fault case is never a match.
+    assert tied[3]["minimalSelected"] == [0]
+    assert tied[3]["minimalCaseId"] == 1

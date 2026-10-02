@@ -12,7 +12,9 @@ from itertools import combinations
 
 from .simulate import ScenarioError, _Simulator, _require_int, parse_scenario
 
-_PLAN_FIELDS = {"scenario", "candidates", "maxFaults", "maxCases"}
+_PLAN_REQUIRED_FIELDS = {"scenario", "candidates", "maxFaults", "maxCases"}
+_PLAN_OPTIONAL_FIELDS = {"minimizeFailures"}
+_PLAN_FIELDS = _PLAN_REQUIRED_FIELDS | _PLAN_OPTIONAL_FIELDS
 
 # Reports whose violation lists decide a case's status. A report the scenario
 # does not enable is absent from the result and plays no part in the verdict.
@@ -32,7 +34,7 @@ def run_explore(raw: object) -> dict:
     unknown = sorted(set(raw) - _PLAN_FIELDS)
     if unknown:
         raise ScenarioError(f"unknown field(s): {', '.join(unknown)}")
-    missing = sorted(_PLAN_FIELDS - set(raw))
+    missing = sorted(_PLAN_REQUIRED_FIELDS - set(raw))
     if missing:
         raise ScenarioError(f"missing field(s): {', '.join(missing)}")
 
@@ -52,6 +54,10 @@ def run_explore(raw: object) -> dict:
     if max_faults > len(candidates):
         raise ScenarioError("maxFaults must not exceed the number of candidates")
     max_cases = _require_int(raw["maxCases"], "maxCases", 1)
+
+    minimize = raw.get("minimizeFailures", False)
+    if not isinstance(minimize, bool):
+        raise ScenarioError("minimizeFailures must be a boolean")
 
     # Validate the base scenario and every candidate rule with the original
     # scenario validation by presenting the candidates as its messageFaults;
@@ -98,9 +104,49 @@ def run_explore(raw: object) -> dict:
                 }
             )
             case_id += 1
+    if minimize:
+        _attach_minimization(cases)
     return {
         "totalCases": len(cases),
         "passedCases": passed,
         "failedCases": len(cases) - passed,
         "cases": cases,
     }
+
+
+def _failure_reports(result: dict) -> list:
+    """Names of enabled reports with non-empty violations, in check order."""
+    return [
+        key
+        for key in _CHECKED_REPORTS
+        if key in result and result[key]["violations"]
+    ]
+
+
+def _attach_minimization(cases: list) -> None:
+    """Add failureReports/minimalSelected/minimalCaseId to every failed case.
+
+    Minimization only deletes rules from the failed case's own selection, so
+    every candidate sub-combination is itself an enumerated case whose stored
+    result decides whether the same failure signature is preserved; no extra
+    simulations are run. The fewest-rule combination wins, ties broken by
+    numeric lexicographic order of the index list; combinations() yields
+    subsets of an ascending tuple in exactly that order.
+    """
+    signatures = [_failure_reports(case["result"]) for case in cases]
+    by_selection = {tuple(case["selected"]): case for case in cases}
+    for case, signature in zip(cases, signatures):
+        if case["status"] != "failed":
+            continue
+        case["failureReports"] = list(signature)
+        selected = case["selected"]
+        minimal = None
+        for size in range(len(selected) + 1):
+            for subset in combinations(selected, size):
+                if signatures[by_selection[subset]["caseId"]] == signature:
+                    minimal = subset
+                    break
+            if minimal is not None:
+                break
+        case["minimalSelected"] = list(minimal)
+        case["minimalCaseId"] = by_selection[minimal]["caseId"]

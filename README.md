@@ -158,12 +158,13 @@ consensus-protocol-lab --help               # 打印用法
 
 ### PLAN 字段
 
-PLAN 是一个 JSON 对象，恰好包含以下四个必填字段，未知字段会被拒绝：
+PLAN 是一个 JSON 对象，包含以下四个必填字段与一个可选字段，未知字段会被拒绝：
 
 - `scenario`（必填）：与 `simulate` 相同的场景对象，但不得包含 `messageFaults` 字段。
 - `candidates`（必填）：非空的消息故障规则数组，每项按 `simulate` 的 `messageFaults` 规则原样校验（含对场景节点的引用检查），完整选择器 `(from, to, message, occurrence)` 不得重复。
 - `maxFaults`（必填）：零至候选规则数的整数（非布尔），每个组合至多选用的规则数。
 - `maxCases`（必填）：正整数（非布尔），允许的组合总数上限。
+- `minimizeFailures`（可选）：JSON 布尔值，省略时视为 `false`。为 `true` 时为每个失败组合附加反例最小化结果（见下）；省略或为 `false` 时，合法旧 PLAN 的标准输出逐字节不变。
 
 ### 枚举与执行
 
@@ -182,10 +183,21 @@ PLAN 是一个 JSON 对象，恰好包含以下四个必填字段，未知字段
   - `selected`：该组合选中的候选下标数组（空数组表示无故障组合）。
   - `status`：`passed` 或 `failed`。结果的 `electionSafety`、`logMatching`、`stateMachineSafety`、`linearizability`、`liveness` 报告中任一 `violations` 非空即为 `failed`，否则为 `passed`；场景未启用的报告不参与判断。
   - `result`：该次仿真的完整结果，与 `simulate` 的输出结构相同（含 `timeline`）。
+  - `failureReports`、`minimalSelected`、`minimalCaseId`（仅在 `minimizeFailures` 为 `true` 且该 case 为 `failed` 时出现）：见下节。
+
+### 反例最小化
+
+`minimizeFailures` 为 `true` 时，组合的枚举范围、顺序与判定完全不变，也不运行任何额外仿真；全部组合完成后，为每个 `failed` case 追加三个字段：
+
+- `failureReports`：该 case 的 `result` 中实际存在且 `violations` 非空的报告名，按 `electionSafety`、`logMatching`、`stateMachineSafety`、`linearizability`、`liveness` 的检查优先级排列；场景未启用而缺席的报告不列入。
+- `minimalSelected`：从该 case 的候选下标中仅删除规则得到的最小复现组合。保留组合对应的既有 case 必须与该 case 具有完全相同的 `failureReports`（若无故障 case 已具有相同签名，它就是最小结果；删除故障后只剩其他违例的组合不得选为最小复现）。选择规则数最少者，数量相同时取下标数组数值字典序最小者。
+- `minimalCaseId`：`minimalSelected` 对应的既有 case 的 `caseId`；复现信息以该 case 的完整 timeline 与报告为准，不另造结果。
+
+最小化引用不计入 `maxCases`；`passed` case 不出现这三个字段；`totalCases`、`passedCases`、`failedCases` 与各 case 的既有字段含义和顺序不变。
 
 ### 错误
 
-PLAN 文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、`scenario` 不是对象或含有 `messageFaults`、场景或候选规则校验失败、完整选择器重复、`candidates` 非列表或为空、`maxFaults`/`maxCases` 为布尔值、非整数或越界、组合总数超过 `maxCases` 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+PLAN 文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、`scenario` 不是对象或含有 `messageFaults`、场景或候选规则校验失败、完整选择器重复、`candidates` 非列表或为空、`maxFaults`/`maxCases` 为布尔值、非整数或越界、`minimizeFailures` 不是 JSON 布尔值、组合总数超过 `maxCases` 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
 ## 现有公开接口
 
