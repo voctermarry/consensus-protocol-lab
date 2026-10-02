@@ -25,6 +25,7 @@ python -m pytest
 ```bash
 consensus-protocol-lab version              # 打印版本号
 consensus-protocol-lab simulate SCENARIO    # 运行 Raft 选主与日志复制仿真
+consensus-protocol-lab explore PLAN         # 有界枚举消息故障组合并逐一仿真
 consensus-protocol-lab --help               # 打印用法
 ```
 
@@ -151,9 +152,44 @@ consensus-protocol-lab --help               # 打印用法
 
 文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复、`readQueries` 非列表或条目的字段缺失/未知、时间越界、节点未知、id 非法或与客户命令/成员变更/其他查询的 id 重复、`livenessChecks` 非列表或条目的字段缺失/未知、`id` 非空且唯一、`type` 非法、时间越界或 `startTime` 大于 `deadline`、`leaderElected` 携带 target、其他类型缺失 target、target 不是非空字符串或引用了不存在的客户命令/查询/成员变更 id 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
+## explore 子命令
+
+`explore` 读取一个 UTF-8 JSON 的 PLAN 文件，在一个基础场景上有界枚举消息故障规则的组合，对每个组合独立运行一次确定性仿真，从而生成可复现的反例。它不读取墙钟、不使用随机数、不创建任何文件，同一 PLAN 的输出逐字节一致。
+
+### PLAN 字段
+
+PLAN 是一个 JSON 对象，恰好包含以下四个必填字段，未知字段会被拒绝：
+
+- `scenario`（必填）：与 `simulate` 相同的场景对象，但不得包含 `messageFaults` 字段。
+- `candidates`（必填）：非空的消息故障规则数组，每项按 `simulate` 的 `messageFaults` 规则原样校验（含对场景节点的引用检查），完整选择器 `(from, to, message, occurrence)` 不得重复。
+- `maxFaults`（必填）：零至候选规则数的整数（非布尔），每个组合至多选用的规则数。
+- `maxCases`（必填）：正整数（非布尔），允许的组合总数上限。
+
+### 枚举与执行
+
+- 先运行不选任何规则的组合，再按规则数从 1 到 `maxFaults` 升序枚举；同一规则数内按候选下标组合的数值字典序排列（`itertools.combinations` 顺序）。
+- 组合总数（即 `k` 从 0 到 `maxFaults` 的 `C(候选数, k)` 之和）超过 `maxCases` 时，在任何仿真开始之前失败。
+- 每个组合独立运行一次仿真：选中的规则按原候选下标顺序注入为该次仿真的 `messageFaults`，未命中发送的规则保持原语义（不报错、不产生输出）；timeline 中 `messageFault` 事件的 `rule` 字段仍为规则在 `candidates` 中的原下标。
+- 某个组合的失败不阻止后续组合运行；全部组合完成后退出码为 0。
+
+### 输出
+
+成功时标准输出只写一个 JSON 对象：
+
+- `totalCases`、`passedCases`、`failedCases`：组合总数与两种结局的数量。
+- `cases`：按枚举顺序排列的数组，每项依次包含：
+  - `caseId`：从零开始递增的序号。
+  - `selected`：该组合选中的候选下标数组（空数组表示无故障组合）。
+  - `status`：`passed` 或 `failed`。结果的 `electionSafety`、`logMatching`、`stateMachineSafety`、`linearizability`、`liveness` 报告中任一 `violations` 非空即为 `failed`，否则为 `passed`；场景未启用的报告不参与判断。
+  - `result`：该次仿真的完整结果，与 `simulate` 的输出结构相同（含 `timeline`）。
+
+### 错误
+
+PLAN 文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、`scenario` 不是对象或含有 `messageFaults`、场景或候选规则校验失败、完整选择器重复、`candidates` 非列表或为空、`maxFaults`/`maxCases` 为布尔值、非整数或越界、组合总数超过 `maxCases` 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+
 ## 现有公开接口
 
-- 命令行程序 `consensus-protocol-lab`（`version`、`simulate` 子命令）
+- 命令行程序 `consensus-protocol-lab`（`version`、`simulate`、`explore` 子命令）
 - Python 包 `consensus_lab`，其 `__version__` 为当前版本号
 
 ## 限制
