@@ -2,7 +2,7 @@
 
 本项目是「分布式共识协议实验平台」的代码仓库，用于逐步实现该方向的共识流程仿真、故障注入与不变量校验能力。
 
-当前已实现确定性的 Raft 选主与日志复制仿真（含快照与日志压缩、联合共识成员变更）：只推进虚拟时间，不读取墙钟、不使用随机数，同一输入产生逐字节一致的输出。
+当前已实现确定性的 Raft 选主与日志复制仿真（含快照与日志压缩、联合共识成员变更、只读查询与线性一致性检查）：只推进虚拟时间，不读取墙钟、不使用随机数，同一输入产生逐字节一致的输出。
 
 ## 环境与安装
 
@@ -64,6 +64,9 @@ consensus-protocol-lab --help               # 打印用法
 - `membershipChanges`（可选，与 `initialMembers` 成对出现）：成员变更请求列表，按输入顺序提供 `time`、`node`、`id`、`action` 与 `member`：
   - `time`：`[0, duration]` 内的非负整数虚拟时间；`node`：接收请求的已有节点名；`id`：全局唯一的非空字符串（不得与客户命令 id 重复）；`member`：目标节点名；`action`：`add` 或 `remove`。
   - 两字段均省略时，不产生任何成员变更相关事件、汇总或节点字段，既有合法场景输出逐字节不变。
+- `readQueries`（可选）：只读查询列表，同一时刻在故障、节点事件、已到达消息、客户命令及其零延迟反应之后按输入顺序受理，再处理超时与心跳。每项包含：
+  - `time`：`[0, duration]` 内的非负整数虚拟时间；`node`：接收查询的已有节点名（非空字符串）；`id`：非空字符串，与客户命令、成员变更和其他查询的 id 全局唯一。
+  - 省略该字段时，不新增 `readResult` 事件、`readProbe`/`readReply` 消息、`reads` 汇总与 `linearizability` 报告，既有合法场景输出逐字节不变。
 
 ### 语义
 
@@ -89,6 +92,11 @@ consensus-protocol-lab --help               # 打印用法
   - 稳定配置提交时，被移除的原 leader 立即成为 follower（原因 `removedFromCluster`），此后既不参选也不投票；该节点仅在之后又被 add 的配置追加后才恢复资格。
   - 上一任 leader 在追加联合项前下线时，追赶状态随之下线，未追加的变更保持未完成；联合项已提交但稳定项未追加时，新当选 leader（含通过快照持有该联合项者）会补追加稳定项，变更不会丢失。
   - 配置项、联合阶段与 learner 进度随日志与快照持久化；崩溃重启后由日志与快照恢复，已提交成员关系不会重复应用或丢失。
+- 启用 `readQueries` 后：
+  - 查询发给离线节点时立即得到 `rejected`/`nodeDown`（`knownLeader` 为 `null`）；发给非 leader 时得到 `rejected`/`notLeader` 并携带当时的 `knownLeader`。
+  - leader 受理查询时先记录 `accepted`，`readIndex` 取当时的 `commitIndex`（leader 已提交并应用的位置），随后向每个节点发送携带查询 id 的 `readProbe`；收到 `readProbe` 的节点在任期不劣于对方时确认并回复携带查询 id 的 `readReply`，否则拒绝并携带自己的任期。两类消息服从既有延迟、`messageFaults`（`message` 接受 `readProbe` 与 `readReply`）、分区、乱序与离线规则。
+  - 只有在 leader 身份与任期未变、且就受理时记录的配置取得有效多数确认时查询才完成：稳定配置取投票集合的严格多数，联合阶段取新旧两个集合各自的严格多数，learner 不计入（leader 自身计入其所属集合）。无后续写入时，只要 leader 与多数持续可达，查询也会凭 `readProbe`/`readReply` 完成。
+  - leader 下线、退位或任期改变时，其未完成的查询结局为 `rejected`/`leadershipLost`；仿真结束时仍未取得同一任期和有效配置多数的查询为 `pending`。不同轮次的回复凭查询 id 与任期匹配，不得混用。
 
 ### 输出
 
@@ -104,6 +112,7 @@ consensus-protocol-lab --help               # 打印用法
   - `snapshotInstalled`：follower 接受 `installSnapshot`（含 `node`、`peer`、`lastIncludedIndex`、`lastIncludedTerm`），仅在提供 `snapshotThreshold` 时出现。
   - 快照消息 `installSnapshot`/`installSnapshotReply` 的发送与 `messageResult`（`installed`、`ignored`、`staleTerm`、`higherTerm`，跨分区或离线投递为 `dropped`）。
   - `nodeLifecycle`：节点 `crash` 或 `restart`（含 `node`、`action`），仅在提供 `nodeEvents` 时出现。
+  - `readResult`：只读查询结果。`accepted`（含 `term`、`readIndex`）、`completed`（含 `term`、`readIndex`）或 `rejected`（含 `reason`，取值 `nodeDown`/`notLeader`/`leadershipLost`，及 `knownLeader`），仅在提供 `readQueries` 时出现；确认消息 `readProbe`/`readReply` 的发送与 `messageResult` 均携带查询 `id`。
   - `membershipResult`：成员变更请求结果。`accepted`（add 且尚未追加联合项时含 `phase: "catchingUp"`）或 `rejected`（含 `reason`，取值 `nodeDown`/`notLeader`/`changeInProgress`/`alreadyMember`/`notMember`/`minimumClusterSize`），仅在提供成员变更字段时出现。
   - `configurationApplied`：节点按索引应用一个已提交配置项（含 `index`、`term`、`id`、`entryType` 为 `joint`/`stable`、`config`、`action`、`member`），仅在提供成员变更字段时出现。
   - 复制配置项的 `appendEntries` 消息结果另含 `configEntries`（每项含 `index`、`id`、`entryType`），与客户命令复制明确区分。
@@ -117,6 +126,11 @@ consensus-protocol-lab --help               # 打印用法
   - `pending`：仍存在于某节点日志中但未达提交多数。
   - `rejected`：发给非 leader（`reason: notLeader`）或离线节点（`reason: nodeDown`，`knownLeader` 为 `null`），含 `reason`、`knownLeader`。
 - `electionSafety`：`leadersByTerm` 按任期列出当选的 leader；同一任期出现多个 leader 时记入 `violations`，否则为空列表。
+- `reads`（仅在提供 `readQueries` 时出现）：按输入顺序给出每个查询的结局，恰为三类之一：
+  - `completed`：取得同一任期、有效配置的多数确认（含 `term`、`readIndex` 与 `state`；`state` 按索引列出截至 `readIndex` 的客户命令，每项含 `index`、`term`、`id`、`command`，不含配置项，快照已压缩的命令仍须返回）。
+  - `rejected`：`nodeDown`（`knownLeader` 为 `null`）、`notLeader` 或 `leadershipLost`，含 `reason`、`knownLeader`。
+  - `pending`：仿真结束时仍未取得多数确认（含 `term`、`readIndex`）。
+- `linearizability`（仅在提供 `readQueries` 时出现）：`violations` 按查询输入顺序检查每个已完成的读：结果不是 `readIndex` 对应的完整命令前缀时记 `nonPrefix`；遗漏查询受理前已提交的写入时记 `staleRead`（含 `missing` 列出遗漏的命令 id）。
 - `logMatching`：`violations` 列出“同索引同任期但内容（客户命令的 id/command，或配置项负载）不同”的情况；跨配置项与快照边界检查（已压缩索引取自已应用历史）。
 - `stateMachineSafety`：`violations` 列出不同节点在同一索引应用了不同条目的情况（配置项与客户命令一并参与索引对齐，并跨快照边界检查）。
 
@@ -124,7 +138,7 @@ consensus-protocol-lab --help               # 打印用法
 
 ### 错误
 
-文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复、`readQueries` 非列表或条目的字段缺失/未知、时间越界、节点未知、id 非法或与客户命令/成员变更/其他查询的 id 重复时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
 ## 现有公开接口
 
@@ -133,6 +147,6 @@ consensus-protocol-lab --help               # 打印用法
 
 ## 限制
 
-- 实现 Raft 选主、心跳、日志复制/提交、快照与日志压缩、联合共识（joint consensus）成员变更，以及节点崩溃与基于持久化状态的重启恢复。
+- 实现 Raft 选主、心跳、日志复制/提交、快照与日志压缩、联合共识（joint consensus）成员变更、基于 `readProbe`/`readReply` 多数确认的只读查询，以及节点崩溃与基于持久化状态的重启恢复。
 - 成员变更采用联合共识两阶段（联合配置项提交后再提交稳定配置项）；learner 先追平日志再进入联合集合；不实现单节点一次多变更等额外成员变更扩展。
 - 仿真不读取墙钟、不使用随机数；持久化为同步建模，不在磁盘上创建任何文件。

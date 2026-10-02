@@ -26,8 +26,13 @@ _KIND_REACTION = 4
 # (t, REACTION, ...) entries ahead of (t, MEMBERSHIP, ...), so a request's own
 # zero-delay cascade likewise drains before the next timed event.
 _KIND_MEMBERSHIP = 5
-_KIND_TIMEOUT = 6
-_KIND_HEARTBEAT = 7
+# Read-only queries are accepted after faults, node events, arrived messages,
+# client commands (and their zero-delay reactions) and membership requests,
+# and before timeouts and heartbeats; a query's own zero-delay probe cascade
+# likewise drains before the next timed event.
+_KIND_READ = 6
+_KIND_TIMEOUT = 7
+_KIND_HEARTBEAT = 8
 
 _TOP_LEVEL_FIELDS = {
     "nodes",
@@ -42,6 +47,7 @@ _TOP_LEVEL_FIELDS = {
     "initialMembers",
     "membershipChanges",
     "messageFaults",
+    "readQueries",
 }
 _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "faults",
@@ -51,6 +57,7 @@ _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "initialMembers",
     "membershipChanges",
     "messageFaults",
+    "readQueries",
 }
 _FAULT_FIELDS = {"time", "action", "groups"}
 _MESSAGE_FAULT_FIELDS = {"from", "to", "message", "occurrence", "action", "delay"}
@@ -63,10 +70,13 @@ _MESSAGE_KINDS = (
     "appendReply",
     "installSnapshot",
     "installSnapshotReply",
+    "readProbe",
+    "readReply",
 )
 _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 _NODE_EVENT_FIELDS = {"time", "node", "action"}
 _MEMBERSHIP_CHANGE_FIELDS = {"time", "node", "id", "action", "member"}
+_READ_QUERY_FIELDS = {"time", "node", "id"}
 
 # Log-entry kinds: ordinary client commands versus replicated configuration
 # entries created by joint-consensus membership changes.
@@ -333,6 +343,7 @@ def parse_scenario(raw: object) -> dict:
 
     initial_members: list[str] | None = None
     membership_enabled = has_initial_members
+    seen_change_ids: set[str] = set()
     if has_initial_members:
         raw_initial = raw["initialMembers"]
         if not isinstance(raw_initial, list) or len(raw_initial) < 3:
@@ -353,7 +364,6 @@ def parse_scenario(raw: object) -> dict:
         raw_changes = raw["membershipChanges"]
         if not isinstance(raw_changes, list):
             raise ScenarioError("membershipChanges must be a list")
-        seen_change_ids: set[str] = set()
         normalized_changes = []
         for index, change in enumerate(raw_changes):
             label = f"membershipChanges[{index}]"
@@ -405,6 +415,46 @@ def parse_scenario(raw: object) -> dict:
                 }
             )
 
+    read_queries_provided = "readQueries" in raw
+    read_queries = raw.get("readQueries", [])
+    if not isinstance(read_queries, list):
+        raise ScenarioError("readQueries must be a list")
+    normalized_read_queries = []
+    seen_read_ids: set[str] = set()
+    for index, query in enumerate(read_queries):
+        label = f"readQueries[{index}]"
+        if not isinstance(query, dict):
+            raise ScenarioError(f"{label} must be an object")
+        unknown = sorted(set(query) - _READ_QUERY_FIELDS)
+        if unknown:
+            raise ScenarioError(f"{label} has unknown field(s): {', '.join(unknown)}")
+        missing = sorted(_READ_QUERY_FIELDS - set(query))
+        if missing:
+            raise ScenarioError(f"{label} missing field(s): {', '.join(missing)}")
+        time = _require_int(query["time"], f"{label}.time", 0)
+        if time > duration:
+            raise ScenarioError(f"{label}.time is beyond the simulation duration")
+        node = query["node"]
+        if not isinstance(node, str) or not node:
+            raise ScenarioError(f"{label}.node must be a non-empty string")
+        if node not in node_set:
+            raise ScenarioError(f"{label}.node references unknown node: {node!r}")
+        query_id = query["id"]
+        if not isinstance(query_id, str) or not query_id:
+            raise ScenarioError(f"{label}.id must be a non-empty string")
+        if query_id in seen_read_ids:
+            raise ScenarioError(f"{label}.id duplicates a previous id: {query_id!r}")
+        if query_id in seen_ids:
+            raise ScenarioError(
+                f"{label}.id duplicates a clientCommands id: {query_id!r}"
+            )
+        if query_id in seen_change_ids:
+            raise ScenarioError(
+                f"{label}.id duplicates a membershipChanges id: {query_id!r}"
+            )
+        seen_read_ids.add(query_id)
+        normalized_read_queries.append({"time": time, "node": node, "id": query_id})
+
     return {
         "nodes": list(nodes),
         "duration": duration,
@@ -420,6 +470,8 @@ def parse_scenario(raw: object) -> dict:
         "membershipEnabled": membership_enabled,
         "initialMembers": initial_members,
         "membershipChanges": normalized_changes if has_initial_members else None,
+        "readQueries": normalized_read_queries,
+        "readQueriesProvided": read_queries_provided,
     }
 
 
@@ -589,6 +641,20 @@ class _Simulator:
         # learner's matchIndex reaches the pre-joint log end, the leader
         # appends the joint config entry.
         self.pending_catchup: dict | None = None
+        # Read-only query bookkeeping.
+        self.read_queries: list[dict] = config["readQueries"]
+        self.read_queries_provided: bool = config["readQueriesProvided"]
+        # query id -> {"node", "term", "readIndex", "config", "acks",
+        #              "required"} for accepted queries still awaiting a
+        # same-term majority confirmation under the recorded configuration.
+        self.pending_reads: dict[str, dict] = {}
+        # query id -> final outcome for queries resolved during the run.
+        self.read_results: dict[str, dict] = {}
+        # query id -> client-command ids already committed when the query was
+        # accepted; a completed read omitting any of them is a stale read.
+        self.read_required: dict[str, set[str]] = {}
+        # Client-command ids committed so far (leader-side commit advances).
+        self.committed_command_ids: set[str] = set()
 
     def run(self) -> dict:
         for order, fault in enumerate(self.faults):
@@ -599,6 +665,8 @@ class _Simulator:
             heapq.heappush(self.queue, (command["time"], _KIND_CLIENT, order, command))
         for order, change in enumerate(self.changes):
             heapq.heappush(self.queue, (change["time"], _KIND_MEMBERSHIP, order, change))
+        for order, query in enumerate(self.read_queries):
+            heapq.heappush(self.queue, (query["time"], _KIND_READ, order, query))
         for name in self.node_names:
             if self._is_voter(name, self.initial_config):
                 heapq.heappush(self.queue, (self.timeouts[name], _KIND_TIMEOUT, self.index[name], (name, 0)))
@@ -607,7 +675,7 @@ class _Simulator:
             if time > self.duration:
                 break
             self.now = time
-            self.reaction_phase = kind in (_KIND_CLIENT, _KIND_MEMBERSHIP, _KIND_REACTION)
+            self.reaction_phase = kind in (_KIND_CLIENT, _KIND_MEMBERSHIP, _KIND_READ, _KIND_REACTION)
             if kind == _KIND_FAULT:
                 self._apply_fault(payload)
             elif kind == _KIND_NODE_EVENT:
@@ -618,6 +686,8 @@ class _Simulator:
                 self._on_client_command(payload)
             elif kind == _KIND_MEMBERSHIP:
                 self._on_membership_change(payload)
+            elif kind == _KIND_READ:
+                self._on_read_query(payload)
             elif kind == _KIND_TIMEOUT:
                 self._on_timeout(*payload)
             else:
@@ -755,6 +825,8 @@ class _Simulator:
         st.match_index = {}
         self._reset_timeout(name)
         self._record_state_change(name, reason)
+        # A deposed leader can no longer vouch for reads it accepted.
+        self._abandon_reads(name)
 
     def _start_election(self, name: str) -> None:
         st = self.state[name]
@@ -849,8 +921,21 @@ class _Simulator:
 
     # -- messages -----------------------------------------------------------
 
+    @staticmethod
+    def _query_id_field(msg: dict) -> dict:
+        """Read-confirmation messages (readProbe/readReply) carry the query id
+        into their timeline entries; no other message kind has one."""
+        return {"id": msg["id"]} if "id" in msg else {}
+
     def _send(self, src: str, dst: str, msg: dict) -> None:
-        self._record({"type": "messageSend", "node": src, "peer": dst, "message": msg["kind"], "term": msg["term"]})
+        self._record({
+            "type": "messageSend",
+            "node": src,
+            "peer": dst,
+            "message": msg["kind"],
+            "term": msg["term"],
+            **self._query_id_field(msg),
+        })
         self.send_counter += 1
         envelope = {**msg, "src": src, "dst": dst}
         # A messageFaults rule matches the occurrence-th actual send of its
@@ -965,6 +1050,7 @@ class _Simulator:
                 "peer": src,
                 "message": msg["kind"],
                 "term": msg["term"],
+                **self._query_id_field(msg),
                 "result": "dropped",
                 "reason": "messageFault",
             })
@@ -979,6 +1065,7 @@ class _Simulator:
                 "peer": src,
                 "message": msg["kind"],
                 "term": msg["term"],
+                **self._query_id_field(msg),
                 "result": "dropped",
                 "reason": "nodeDown",
             })
@@ -990,6 +1077,7 @@ class _Simulator:
                 "peer": src,
                 "message": msg["kind"],
                 "term": msg["term"],
+                **self._query_id_field(msg),
                 "result": "dropped",
                 "reason": "partition",
             })
@@ -1007,6 +1095,10 @@ class _Simulator:
             self._handle_install_snapshot(msg)
         elif kind == "installSnapshotReply":
             self._handle_snapshot_reply(msg)
+        elif kind == "readProbe":
+            self._handle_read_probe(msg)
+        elif kind == "readReply":
+            self._handle_read_reply(msg)
         else:
             self._handle_append_reply(msg)
 
@@ -1545,6 +1637,223 @@ class _Simulator:
         })
         self._replicate_to(dst, src)
 
+    # -- read-only queries ----------------------------------------------------
+
+    @staticmethod
+    def _read_state_entry(entry: dict) -> dict:
+        """The read-state view of one applied client command. Configuration
+        entries never appear in a read state."""
+        return {
+            "index": entry["index"],
+            "term": entry["term"],
+            "id": entry["id"],
+            "command": entry["command"],
+        }
+
+    def _on_read_query(self, query: dict) -> None:
+        node = query["node"]
+        query_id = query["id"]
+        st = self.state[node]
+        if not st.online:
+            self.read_results[query_id] = {
+                "outcome": "rejected",
+                "reason": "nodeDown",
+                "knownLeader": None,
+            }
+            self._record({
+                "type": "readResult",
+                "node": node,
+                "id": query_id,
+                "result": "rejected",
+                "reason": "nodeDown",
+                "knownLeader": None,
+            })
+            return
+        if st.role != ROLE_LEADER:
+            self.read_results[query_id] = {
+                "outcome": "rejected",
+                "reason": "notLeader",
+                "knownLeader": st.known_leader,
+            }
+            self._record({
+                "type": "readResult",
+                "node": node,
+                "id": query_id,
+                "result": "rejected",
+                "reason": "notLeader",
+                "knownLeader": st.known_leader,
+            })
+            return
+
+        # Accepted: the read linearizes at the leader's current committed (and
+        # therefore applied) position once a same-term majority of the
+        # configuration recorded here confirms the leader's authority.
+        read_index = st.commit_index
+        self.pending_reads[query_id] = {
+            "node": node,
+            "term": st.term,
+            "readIndex": read_index,
+            "config": st.latest_config(self.initial_config),
+            "acks": {node},
+        }
+        self.read_required[query_id] = set(self.committed_command_ids)
+        self._record({
+            "type": "readResult",
+            "node": node,
+            "id": query_id,
+            "result": "accepted",
+            "term": st.term,
+            "readIndex": read_index,
+        })
+        for peer in self.node_names:
+            if peer != node:
+                self._send(
+                    node,
+                    peer,
+                    {
+                        "kind": "readProbe",
+                        "term": st.term,
+                        "id": query_id,
+                        "readIndex": read_index,
+                    },
+                )
+        self._check_read_completion(query_id)
+
+    def _check_read_completion(self, query_id: str) -> None:
+        """Complete a pending read once a strict majority of every quorum
+        group of the recorded configuration (stable: the voter set; joint:
+        both the old and the new sets; learners never count) has acknowledged
+        the probe in the same term."""
+        read = self.pending_reads.get(query_id)
+        if read is None:
+            return
+        name = read["node"]
+        st = self.state[name]
+        if st.role != ROLE_LEADER or st.term != read["term"]:
+            return
+        if not self._has_vote_majorities(name, read["acks"], read["config"]):
+            return
+        read_index = read["readIndex"]
+        state = [
+            self._read_state_entry(entry)
+            for entry in st.applied[:read_index]
+            if entry.get("kind") != KIND_CONFIG
+        ]
+        del self.pending_reads[query_id]
+        self.read_results[query_id] = {
+            "outcome": "completed",
+            "term": read["term"],
+            "readIndex": read_index,
+            "state": state,
+        }
+        self._record({
+            "type": "readResult",
+            "node": name,
+            "id": query_id,
+            "result": "completed",
+            "term": read["term"],
+            "readIndex": read_index,
+        })
+
+    def _abandon_reads(self, name: str) -> None:
+        """Fail every read still pending on a node that stopped being leader
+        (stepped down, was removed from the cluster, or went offline)."""
+        doomed = [
+            query_id
+            for query_id, read in self.pending_reads.items()
+            if read["node"] == name
+        ]
+        for query_id in doomed:
+            del self.pending_reads[query_id]
+            self.read_results[query_id] = {
+                "outcome": "rejected",
+                "reason": "leadershipLost",
+                "knownLeader": None,
+            }
+            self._record({
+                "type": "readResult",
+                "node": name,
+                "id": query_id,
+                "result": "rejected",
+                "reason": "leadershipLost",
+                "knownLeader": None,
+            })
+
+    def _handle_read_probe(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        accepted = msg["term"] >= st.term
+        self._record({
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "readProbe",
+            "term": msg["term"],
+            "id": msg["id"],
+            "result": "delivered",
+            "detail": "accepted" if accepted else "staleTerm",
+        })
+        if accepted:
+            if msg["term"] > st.term or st.role != ROLE_FOLLOWER:
+                self._become_follower(dst, msg["term"], "readProbe")
+            else:
+                self._reset_timeout(dst)
+            st.known_leader = src
+        self._send(
+            dst,
+            src,
+            {
+                "kind": "readReply",
+                "term": st.term,
+                "id": msg["id"],
+                "granted": accepted,
+            },
+        )
+
+    def _handle_read_reply(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        query_id = msg["id"]
+        if msg["term"] > st.term:
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": "readReply",
+                "term": msg["term"],
+                "id": query_id,
+                "result": "delivered",
+                "detail": "higherTerm",
+            })
+            self._become_follower(dst, msg["term"], "higherTermMessage")
+            return
+        # Only a granted reply from the very round that is still pending —
+        # same query id, same leader, same term — counts; replies from older
+        # or newer rounds are ignored and never mixed in.
+        read = self.pending_reads.get(query_id)
+        counted = (
+            st.role == ROLE_LEADER
+            and msg["term"] == st.term
+            and msg.get("granted", False)
+            and read is not None
+            and read["node"] == dst
+            and read["term"] == st.term
+        )
+        if counted:
+            read["acks"].add(src)
+        self._record({
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "readReply",
+            "term": msg["term"],
+            "id": query_id,
+            "result": "delivered",
+            "detail": "acknowledged" if counted else "ignored",
+        })
+        if counted:
+            self._check_read_completion(query_id)
+
     # -- client commands ----------------------------------------------------
 
     def _on_client_command(self, command: dict) -> None:
@@ -1765,6 +2074,12 @@ class _Simulator:
             # entry commits, so it and later entries use the new single set.
             config = st.config_at(candidate + 1, self.initial_config)
             if self._replicated_by_majorities(name, candidate, config):
+                # Track the client commands this commit covers so that reads
+                # accepted later can be checked for staleness.
+                for index in range(st.commit_index + 1, candidate + 1):
+                    view = self._entry_view(st, index)
+                    if view is not None and view.get("kind") != KIND_CONFIG:
+                        self.committed_command_ids.add(view["id"])
                 st.commit_index = candidate
                 self._record({
                     "type": "commitAdvance",
@@ -1899,6 +2214,7 @@ class _Simulator:
         # _reset_timeout cancels the timer for a now non-voting node.
         self._reset_timeout(name)
         self._record_state_change(name, "removedFromCluster")
+        self._abandon_reads(name)
 
     def _create_snapshot(self, name: str) -> None:
         """Fold every applied entry through last_applied into the snapshot and
@@ -1955,6 +2271,8 @@ class _Simulator:
             st.online = False
             st.timeout_gen += 1  # invalidate any pending election timeout
             self._record({"type": "nodeLifecycle", "node": name, "action": "crash"})
+            # A crashed leader cannot confirm the reads it accepted.
+            self._abandon_reads(name)
             return
         # Restart: persisted state survives; volatile state is reset. The
         # node comes back as a follower with no known leader, no candidate
@@ -2285,6 +2603,56 @@ class _Simulator:
                 found = entry["id"]
         return found
 
+    def _reads_report(self) -> list[dict]:
+        """The final outcome of every read query, in input order. Queries
+        still awaiting a majority confirmation when the simulation ends are
+        reported as pending."""
+        reads = []
+        for query in self.read_queries:
+            query_id = query["id"]
+            result = self.read_results.get(query_id)
+            if result is None:
+                pending = self.pending_reads[query_id]
+                result = {
+                    "outcome": "pending",
+                    "term": pending["term"],
+                    "readIndex": pending["readIndex"],
+                }
+            reads.append({"id": query_id, "node": query["node"], **result})
+        return reads
+
+    def _linearizability_violations(self) -> list[dict]:
+        """Per completed read, checked in input order:
+        - nonPrefix: the returned state is not the complete client-command
+          prefix of the serving leader's applied history up to readIndex
+          (configuration entries excluded, compacted commands included);
+        - staleRead: the state omits a write that was already committed when
+          the query was accepted."""
+        violations = []
+        for query in self.read_queries:
+            query_id = query["id"]
+            result = self.read_results.get(query_id)
+            if result is None or result.get("outcome") != "completed":
+                continue
+            read_index = result["readIndex"]
+            st = self.state[query["node"]]
+            expected = [
+                self._read_state_entry(entry)
+                for entry in st.applied[:read_index]
+                if entry.get("kind") != KIND_CONFIG
+            ]
+            if result["state"] != expected:
+                violations.append(
+                    {"type": "nonPrefix", "id": query_id, "readIndex": read_index}
+                )
+            present = {entry["id"] for entry in result["state"]}
+            missing = sorted(self.read_required.get(query_id, set()) - present)
+            if missing:
+                violations.append(
+                    {"type": "staleRead", "id": query_id, "missing": missing}
+                )
+        return violations
+
     def _report(self) -> dict:
         leaders = {str(term): names for term, names in sorted(self.leaders_by_term.items())}
         violations = [
@@ -2299,13 +2667,19 @@ class _Simulator:
                 for name, st in self.state.items()
             },
             "clients": self._clients_report(),
-            "electionSafety": {
-                "leadersByTerm": leaders,
-                "violations": violations,
-            },
-            "logMatching": {"violations": self._log_matching_violations()},
-            "stateMachineSafety": {"violations": self._state_machine_safety_violations()},
         }
+        if self.read_queries_provided:
+            report["reads"] = self._reads_report()
+        report["electionSafety"] = {
+            "leadersByTerm": leaders,
+            "violations": violations,
+        }
+        report["logMatching"] = {"violations": self._log_matching_violations()}
+        report["stateMachineSafety"] = {"violations": self._state_machine_safety_violations()}
+        if self.read_queries_provided:
+            report["linearizability"] = {
+                "violations": self._linearizability_violations()
+            }
         if self.membership_enabled:
             report["membership"] = self._membership_report()
         return report
