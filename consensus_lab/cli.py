@@ -8,24 +8,36 @@ import sys
 
 from . import __version__
 from .explore import run_explore
+from .replay import run_replay
 from .simulate import ScenarioError, run_simulation
 
 
-def _cmd_simulate(path: str) -> int:
+def _read_json_file(path: str, kind: str) -> tuple[object | None, int | None]:
+    """Read and decode a UTF-8 JSON file.
+
+    Returns ``(value, None)`` on success or ``(None, 2)`` after writing a
+    single ``error:`` line on any read, encoding or syntax failure.
+    """
     try:
         with open(path, "r", encoding="utf-8") as handle:
             text = handle.read()
     except OSError as exc:
-        print(f"error: cannot read scenario file: {exc}", file=sys.stderr)
-        return 2
+        print(f"error: cannot read {kind} file: {exc}", file=sys.stderr)
+        return None, 2
     except UnicodeDecodeError:
-        print(f"error: scenario file is not valid UTF-8: {path}", file=sys.stderr)
-        return 2
+        print(f"error: {kind} file is not valid UTF-8: {path}", file=sys.stderr)
+        return None, 2
     try:
-        raw = json.loads(text)
+        return json.loads(text), None
     except json.JSONDecodeError as exc:
         print(f"error: invalid JSON: {exc}", file=sys.stderr)
-        return 2
+        return None, 2
+
+
+def _cmd_simulate(path: str) -> int:
+    raw, code = _read_json_file(path, "scenario")
+    if code is not None:
+        return code
     try:
         result = run_simulation(raw)
     except ScenarioError as exc:
@@ -36,20 +48,9 @@ def _cmd_simulate(path: str) -> int:
 
 
 def _cmd_explore(path: str) -> int:
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read()
-    except OSError as exc:
-        print(f"error: cannot read plan file: {exc}", file=sys.stderr)
-        return 2
-    except UnicodeDecodeError:
-        print(f"error: plan file is not valid UTF-8: {path}", file=sys.stderr)
-        return 2
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
-        print(f"error: invalid JSON: {exc}", file=sys.stderr)
-        return 2
+    raw, code = _read_json_file(path, "plan")
+    if code is not None:
+        return code
     try:
         result = run_explore(raw)
     except ScenarioError as exc:
@@ -57,6 +58,22 @@ def _cmd_explore(path: str) -> int:
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
+
+
+def _cmd_replay(scenario_path: str, result_path: str) -> int:
+    scenario_raw, code = _read_json_file(scenario_path, "scenario")
+    if code is not None:
+        return code
+    result_raw, code = _read_json_file(result_path, "result")
+    if code is not None:
+        return code
+    try:
+        verdict = run_replay(scenario_raw, result_raw)
+    except ScenarioError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(verdict, ensure_ascii=False, separators=(",", ":")))
+    return 0 if verdict["status"] == "matched" else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -67,6 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     simulate.add_argument("scenario", help="path to a UTF-8 JSON scenario file")
     explore = sub.add_parser("explore", help="enumerate bounded message-fault combinations over a base scenario")
     explore.add_argument("plan", help="path to a UTF-8 JSON plan file")
+    replay = sub.add_parser("replay", help="verify a saved simulate result is reproduced by its scenario")
+    replay.add_argument("scenario", help="path to the UTF-8 JSON scenario file")
+    replay.add_argument("result", help="path to a UTF-8 JSON file holding one simulate result")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -76,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_simulate(args.scenario)
     if args.command == "explore":
         return _cmd_explore(args.plan)
+    if args.command == "replay":
+        return _cmd_replay(args.scenario, args.result)
 
     parser.print_help()
     return 0

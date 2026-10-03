@@ -26,6 +26,7 @@ python -m pytest
 consensus-protocol-lab version              # 打印版本号
 consensus-protocol-lab simulate SCENARIO    # 运行 Raft 选主与日志复制仿真
 consensus-protocol-lab explore PLAN         # 有界枚举消息故障组合并逐一仿真
+consensus-protocol-lab replay SCENARIO RESULT  # 核验已保存的 simulate 结果能否由原场景重现
 consensus-protocol-lab --help               # 打印用法
 ```
 
@@ -192,9 +193,37 @@ PLAN 是一个 JSON 对象，包含以下四个必填字段，未知字段会被
 
 PLAN 文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、`scenario` 不是对象或含有 `messageFaults`、场景或候选规则校验失败、完整选择器重复、`candidates` 非列表或为空、`maxFaults`/`maxCases` 为布尔值、非整数或越界、`minimizeFailures` 不是 JSON 布尔值、组合总数超过 `maxCases` 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
+## replay 子命令
+
+`replay` 是只读命令：它读取一个 UTF-8 JSON 场景文件（与 `simulate` 的输入相同）和一个保存了某次 `simulate` 输出的 UTF-8 JSON 文件，按 `simulate` 的既有校验和仿真语义重新计算结果，再与保存结果做完整 JSON 结构比较。它不创建或改写任何文件，`timeline`、各项终态与全部报告都参与比较。
+
+### 相等规则
+
+- 对象成员顺序不影响相等性。
+- 数组顺序必须逐索引一致。
+- 字符串按 Unicode 内容精确比较（不做规范化，NFC 与 NFD 视为不同）。
+- JSON 数字按数值比较（整数 `1` 与浮点 `1.0` 相等）。
+- 布尔值是独立类型，不得与数字（如 `true` 与 `1`）相等。
+
+首个差异的定位是确定的：数组按索引递增比较；对象取两侧键的并集，按 Unicode 码点升序递归比较；类型或标量不同时在当前位置结束；公共前缀相同但数组长度不同时指向第一个缺失的索引；根值差异使用空字符串。路径以 RFC 6901 JSON Pointer 表示，键中的 `~` 写作 `~0`、`/` 写作 `~1`。
+
+### 输出与退出码
+
+- 完全相同：标准输出只写 `{"status":"matched"}`（无多余空白，末尾一个换行），退出码 0。相同输入的标准输出逐字节一致。
+- 存在差异：退出码 1，标准输出写一个对象，依次包含：
+  - `status`：`"mismatched"`。
+  - `path`：首个差异的 RFC 6901 JSON Pointer。
+  - `expectedPresent`、`actualPresent`：该位置在重新计算结果与保存结果中是否存在。
+  - `expected`、`actual`：仅在对应值存在时出现，给出该位置两侧的值。
+- RESULT 缺字段、含未知字段，或来自不同场景（只要其顶层是 JSON 对象），一律按 `mismatched` 报告并返回 1。
+
+### 错误
+
+任一文件不可读、非 UTF-8 或 JSON 语法错误，SCENARIO 不符合现有场景约束，或 RESULT 顶层不是 JSON 对象时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+
 ## 现有公开接口
 
-- 命令行程序 `consensus-protocol-lab`（`version`、`simulate`、`explore` 子命令）
+- 命令行程序 `consensus-protocol-lab`（`version`、`simulate`、`explore`、`replay` 子命令）
 - Python 包 `consensus_lab`，其 `__version__` 为当前版本号
 
 ## 限制
