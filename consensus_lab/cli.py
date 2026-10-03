@@ -8,6 +8,7 @@ import sys
 
 from . import __version__
 from .explore import run_explore
+from .replay import run_replay
 from .simulate import ScenarioError, run_simulation
 
 
@@ -59,6 +60,56 @@ def _cmd_explore(path: str) -> int:
     return 0
 
 
+def _read_utf8_json(path: str, kind: str) -> tuple[bool, object]:
+    """Read and decode a UTF-8 JSON file for replay. Returns (ok, value);
+    on failure prints one ``error:`` line to stderr and returns (False,
+    None). ``kind`` labels the file in the messages."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        print(f"error: cannot read {kind} file: {exc}", file=sys.stderr)
+        return False, None
+    except UnicodeDecodeError:
+        print(f"error: {kind} file is not valid UTF-8: {path}", file=sys.stderr)
+        return False, None
+    try:
+        # parse_constant rejects the non-standard NaN/Infinity tokens that
+        # Python's decoder otherwise accepts; strict JSON treats them as
+        # syntax errors.
+        return True, json.loads(text, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"error: invalid JSON in {kind} file: {exc}", file=sys.stderr)
+        return False, None
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON token: {value}")
+
+
+def _cmd_replay(scenario_path: str, result_path: str) -> int:
+    ok, scenario_raw = _read_utf8_json(scenario_path, "scenario")
+    if not ok:
+        return 2
+    ok, result_raw = _read_utf8_json(result_path, "result")
+    if not ok:
+        return 2
+    # A non-object RESULT cannot carry the comparison contract (status is
+    # reported as mismatched only when the top level is an object).
+    if not isinstance(result_raw, dict):
+        print("error: result file must contain a JSON object", file=sys.stderr)
+        return 2
+    try:
+        report = run_replay(scenario_raw, result_raw)
+    except ScenarioError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # Compact, member order fixed by construction: byte-identical for
+    # identical input.
+    print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+    return 0 if report["status"] == "matched" else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="consensus-protocol-lab", description="Deterministic simulation lab for Raft-style consensus protocols")
     sub = parser.add_subparsers(dest="command")
@@ -67,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     simulate.add_argument("scenario", help="path to a UTF-8 JSON scenario file")
     explore = sub.add_parser("explore", help="enumerate bounded message-fault combinations over a base scenario")
     explore.add_argument("plan", help="path to a UTF-8 JSON plan file")
+    replay = sub.add_parser("replay", help="recompute a simulation and field-compare it against a saved result")
+    replay.add_argument("scenario", help="path to the UTF-8 JSON scenario file")
+    replay.add_argument("result", help="path to a UTF-8 JSON file holding a simulate result")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -76,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_simulate(args.scenario)
     if args.command == "explore":
         return _cmd_explore(args.plan)
+    if args.command == "replay":
+        return _cmd_replay(args.scenario, args.result)
 
     parser.print_help()
     return 0
