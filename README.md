@@ -2,7 +2,7 @@
 
 本项目是「分布式共识协议实验平台」的代码仓库，用于逐步实现该方向的共识流程仿真、故障注入与不变量校验能力。
 
-当前已实现确定性的 Raft 选主与日志复制仿真（含快照与日志压缩、联合共识成员变更、只读查询与线性一致性检查、基于虚拟时间的可选活性检查）：只推进虚拟时间，不读取墙钟、不使用随机数，同一输入产生逐字节一致的输出。
+当前已实现确定性的 Raft 选主与日志复制仿真（含快照与日志压缩、联合共识成员变更、只读查询与线性一致性检查、基于虚拟时间的可选活性检查，以及可选的预投票 pre-vote 阶段）：只推进虚拟时间，不读取墙钟、不使用随机数，同一输入产生逐字节一致的输出。
 
 ## 环境与安装
 
@@ -47,7 +47,7 @@ consensus-protocol-lab --help               # 打印用法
   - `time` 必须在 `[0, duration]` 范围内。
 - `messageFaults`（可选）：消息级故障规则列表，精确命中某一次发送。每项包含：
   - `from`、`to`：两个不同的已有节点名（非空字符串）。
-  - `message`：`requestVote`、`voteReply`、`heartbeat`、`appendEntries`、`appendReply`、`installSnapshot`、`installSnapshotReply` 之一。
+  - `message`：`requestVote`、`voteReply`、`heartbeat`、`appendEntries`、`appendReply`、`installSnapshot`、`installSnapshotReply` 之一（启用只读查询时另有 `readProbe`、`readReply`；启用预投票时另有 `preVote`、`preVoteReply`）。
   - `occurrence`：正整数，按 `(from, to, message)` 相同的选择器从仿真开始对实际发送计数，命中第几次发送。
   - `action`：`drop` 或 `delay`。`drop` 不得携带 `delay` 字段；`delay` 必须携带非负整数 `delay`，实际到达时刻为发送时刻加 `messageDelay` 再加该值。
   - 完整选择器 `(from, to, message, occurrence)` 不得重复；未匹配到任何发送的规则不报错、不产生输出。
@@ -75,6 +75,7 @@ consensus-protocol-lab --help               # 打印用法
   - `startTime`、`deadline`：均为 `[0, duration]` 内的非负整数虚拟时间，且 `startTime` 不大于 `deadline`。
   - `target`：`clientCommitted`、`readCompleted`、`membershipCommitted` 分别必须引用一个已有的 `clientCommands`、`readQueries`、`membershipChanges` 的 id（非空字符串）；`leaderElected` 禁止携带该字段。
   - 省略该字段时，不新增任何事件或顶层字段，既有合法场景输出逐字节不变。
+- `preVote`（可选）：JSON 布尔值，省略或为 `false` 时关闭，既有合法输入输出逐字节不变；为 `true` 时在正式选举前增加可选的预投票阶段（详见“预投票阶段”）。关闭时在 `messageFaults` 中引用 `preVote` 或 `preVoteReply` 属于非法场景。
 
 ### 语义
 
@@ -108,6 +109,13 @@ consensus-protocol-lab --help               # 打印用法
 - 提供 `livenessChecks` 后，检查在闭区间 `[startTime, deadline]` 内寻找首次满足时刻：每个虚拟时刻先处理完既有事件及其零延迟反应，再按检查的输入顺序评估。若条件在此前已经完成且在 `startTime` 仍成立，结果时间取 `startTime`。
   - `leaderElected` 以当时存在在线 leader 为准；`clientCommitted` 以命令已提交为准；`readCompleted` 以查询已完成（`completed`）为准；`membershipCommitted` 以稳定配置项已提交为准。
   - 满足时在 timeline 追加 `livenessResult`；到 `deadline` 仍未满足时记为失败：目标命令已拒绝或已被覆盖分别给出 `targetRejected`、`targetSuperseded`，目标查询或成员变更已拒绝给出 `targetRejected`，其余为 `deadlineExceeded`。失败不改变退出码，也不停止仿真。
+- 启用预投票阶段（`preVote: true`）后，有投票资格的在线节点在选举超时时先成为 `preCandidate`，而**不**增加或持久化任期、**不**改写 `votedFor`：
+  - 预候选人以“当前任期加一”作为 `prospectiveTerm`，并为本次尝试分配逐次递增的 `round`，向当前配置中的其他投票者发送 `preVote`（携带自身当前 `term`、`prospectiveTerm`、`round`、最后日志位置 `lastLogIndex`/`lastLogTerm`）。
+  - 接收者仅在以下条件全部成立时回复 `granted`：自身有投票资格（learner 与被移除成员拒绝）；自己不是在任 leader；`prospectiveTerm` 不小于本地任期加一；请求者日志与自己至少同样新；且距最近一次接受当前任期的 `heartbeat`、`appendEntries` 或 `installSnapshot` 起，本地选举截止时刻（最近接触时刻加本节点 `electionTimeout`）已到（从未接触过 leader、刚启动或刚重启时该条件视为成立）。其余一律回复 `rejected`。预投票请求与拒绝都**不**改变接收者的任期、投票或选举截止时刻，回复携带接收者当前（未变）的任期。
+  - 发起者自行计票并把自己计入：稳定配置取投票集合的严格多数；联合阶段须同时满足新旧两个集合各自的严格多数，learner 不计入。只有当节点仍在线、仍有资格、处于同一 `round` 且任期未变并取得所需多数时，才把任期提升到 `prospectiveTerm`、自投并转入正式 `candidate`（状态变化原因 `preVoteMajority`），随后按原语义在该任期广播 `requestVote`；否则不提升任期。
+  - 后续选举超时开启新的 `round`（正式选举未收敛后的下一次超时同样重新预投票，`prospectiveTerm` 取当时任期加一）。合法的当前任期 leader 消息（heartbeat/appendEntries/installSnapshot）、更高实际任期的消息、节点崩溃或投票资格丧失都会取消旧轮次；旧轮次迟到的 `preVoteReply` 记为 `staleRound`，携带更高实际任期的回复记为 `higherTerm` 并使节点按更高任期退回 follower。
+  - 预投票状态（`round`、`prospectiveTerm`、预投票得票与所用配置）不持久化：崩溃或重启后清空，节点以 follower 重新等待一个完整的选举超时；轮次序号在节点生存期内单调不复用，因此跨重启在途的回复仍只能是陈旧轮次。
+  - `preVote` 与 `preVoteReply` 沿用 `messageFaults` 及既有延迟、丢弃、乱序、分区与离线规则，其发送、投递、丢弃与乱序结果都携带 `round` 与 `prospectiveTerm`。
 
 ### 输出
 
@@ -117,6 +125,7 @@ consensus-protocol-lab --help               # 打印用法
   - `messageFault`：一条 `messageFaults` 规则命中某次发送（含 `rule` 规则在输入列表中的序号、`from`、`to`、`message`、`occurrence`、`action`、`scheduledTime` 原计划到达时刻；`delay` 规则另含 `arrivalTime` 实际到达时刻），仅在提供 `messageFaults` 且规则命中时出现。
   - `clientResult`：`accepted`（含 `index`、`term`）或 `rejected`（含 `reason: notLeader`、`knownLeader`）。
   - 复制消息 `appendEntries`/`appendReply` 的发送与 `messageResult`（`accepted`、`conflict`、`staleTerm`、`matched`、`higherTerm`、`ignored` 等）。
+  - 预投票消息 `preVote`/`preVoteReply` 的发送与 `messageResult`（仅在 `preVote: true` 时出现），其发送、送达（`preVote` 明细为 `granted`/`rejected`，`preVoteReply` 明细为 `granted`/`rejected`/`staleRound`/`higherTerm`）与丢弃（`messageFault`/`nodeDown`/`partition`）事件均携带 `round` 与 `prospectiveTerm`；节点进入预候选人或凭预投票多数转正时用既有 `stateChange` 记录（`role` 为 `preCandidate`/`candidate`，原因分别为 `electionTimeout`/`preVoteMajority`）。
   - `commitAdvance`：leader 推进 `commitIndex`。
   - `applied`：节点按索引应用一条已提交条目（含 `index`、`term`、`id`）。
   - `snapshotCreated`：节点在应用后保存快照（含 `node`、`lastIncludedIndex`、`lastIncludedTerm`），仅在提供 `snapshotThreshold` 时出现。
@@ -128,7 +137,7 @@ consensus-protocol-lab --help               # 打印用法
   - `configurationApplied`：节点按索引应用一个已提交配置项（含 `index`、`term`、`id`、`entryType` 为 `joint`/`stable`、`config`、`action`、`member`），仅在提供成员变更字段时出现。
   - 复制配置项的 `appendEntries` 消息结果另含 `configEntries`（每项含 `index`、`id`、`entryType`），与客户命令复制明确区分。
   - `livenessResult`：活性检查的最终结果，位于同刻全部既有事件（含零延迟反应）之后（仅在提供 `livenessChecks` 时出现）。含检查 `id`、`checkType`（检查类型，取值同输入 `type`）、`status` 为 `satisfied`/`failed`；带 target 的检查另含 `target`，失败另含 `reason`（`targetRejected`/`targetSuperseded`/`deadlineExceeded`）。结果发生时刻由外层 `time` 给出。
-- `nodes`：各节点最终的 `role`、`term`、`votedFor`、`knownLeader`，以及 `log`（仅含未压缩后缀，仍带全局 `index`/`term`/`id`/`command`；启用成员变更时客户命令条目含 `kind: "command"`，配置项含 `kind: "config"`、`entryType`、`config`、`action`、`member`）、`commitIndex`、`lastApplied`、`applied`（同样以 `kind` 区分两类条目）；提供 `snapshotThreshold` 时另含 `snapshot`（`{"lastIncludedIndex", "lastIncludedTerm"}`，未创建快照时为 `null`）；提供 `nodeEvents` 时另含 `online` 与 `restartCount`；提供成员变更字段时另含 `membershipRole`（按该节点最新配置取 `voter` 或 `learner`）。
+- `nodes`：各节点最终的 `role`、`term`、`votedFor`、`knownLeader`，以及 `log`（仅含未压缩后缀，仍带全局 `index`/`term`/`id`/`command`；启用成员变更时客户命令条目含 `kind: "command"`，配置项含 `kind: "config"`、`entryType`、`config`、`action`、`member`）、`commitIndex`、`lastApplied`、`applied`（同样以 `kind` 区分两类条目）；提供 `snapshotThreshold` 时另含 `snapshot`（`{"lastIncludedIndex", "lastIncludedTerm"}`，未创建快照时为 `null`）；提供 `nodeEvents` 时另含 `online` 与 `restartCount`；提供成员变更字段时另含 `membershipRole`（按该节点最新配置取 `voter` 或 `learner`）。启用 `preVote` 时 `role` 可以是 `preCandidate`（其 `term`/`votedFor` 仍为预投票前的持久化值），但 `electionSafety` 只统计正式当选的 leader。
 - `membership`（仅在提供成员变更字段时出现）：
   - `initial`：初始投票集合；`current`：当前已提交的稳定投票集合（联合阶段仍为旧稳定集合）；`joint`：联合阶段为 `{"id", "old", "new"}`，否则为 `null`。
   - `changes`：按输入顺序给出每个 id 的结局：`committed`（含稳定配置项的 `index`、`term`）、`pending`（含 `phase: "catchingUp"` 或 `phase: "joint"`，后者另含 `joint`）或 `rejected`（含 `reason`）。
@@ -137,7 +146,7 @@ consensus-protocol-lab --help               # 打印用法
   - `superseded`：曾被接受但在提交前被更高任期的日志覆盖删除。
   - `pending`：仍存在于某节点日志中但未达提交多数。
   - `rejected`：发给非 leader（`reason: notLeader`）或离线节点（`reason: nodeDown`，`knownLeader` 为 `null`），含 `reason`、`knownLeader`。
-- `electionSafety`：`leadersByTerm` 按任期列出当选的 leader；同一任期出现多个 leader 时记入 `violations`，否则为空列表。
+- `electionSafety`：`leadersByTerm` 按任期列出正式当选的 leader；同一任期出现多个正式 leader 时记入 `violations`，否则为空列表。预候选人（`preCandidate`）从不计入，即使其终态仍为 `preCandidate`。
 - `reads`（仅在提供 `readQueries` 时出现）：按输入顺序给出每个查询的结局，恰为三类之一：
   - `completed`：取得同一任期、有效配置的多数确认（含 `term`、`readIndex` 与 `state`；`state` 按索引列出截至 `readIndex` 的客户命令，每项含 `index`、`term`、`id`、`command`，不含配置项，快照已压缩的命令仍须返回）。
   - `rejected`：`nodeDown`（`knownLeader` 为 `null`）、`notLeader` 或 `leadershipLost`，含 `reason`、`knownLeader`。
@@ -147,11 +156,11 @@ consensus-protocol-lab --help               # 打印用法
 - `logMatching`：`violations` 列出“同索引同任期但内容（客户命令的 id/command，或配置项负载）不同”的情况；跨配置项与快照边界检查（已压缩索引取自已应用历史）。
 - `stateMachineSafety`：`violations` 列出不同节点在同一索引应用了不同条目的情况（配置项与客户命令一并参与索引对齐，并跨快照边界检查）。
 
-未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息；未同时提供 `initialMembers` 与 `membershipChanges` 时，不新增 `membership` 汇总、`membershipRole`、成员事件与配置项标记；未提供 `messageFaults` 时，不新增 `messageFault` 事件与 `messageFault` 原因的丢弃结果；未提供 `livenessChecks` 时，不新增 `livenessResult` 事件与 `liveness` 顶层字段，既有合法场景的输出逐字节不变。
+未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息；未同时提供 `initialMembers` 与 `membershipChanges` 时，不新增 `membership` 汇总、`membershipRole`、成员事件与配置项标记；未提供 `messageFaults` 时，不新增 `messageFault` 事件与 `messageFault` 原因的丢弃结果；未提供 `livenessChecks` 时，不新增 `livenessResult` 事件与 `liveness` 顶层字段；省略 `preVote` 或其为 `false` 时，不新增 `preCandidate` 角色、`preVote`/`preVoteReply` 消息与 `round`/`prospectiveTerm` 字段，既有合法场景的输出逐字节不变。
 
 ### 错误
 
-文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复、`readQueries` 非列表或条目的字段缺失/未知、时间越界、节点未知、id 非法或与客户命令/成员变更/其他查询的 id 重复、`livenessChecks` 非列表或条目的字段缺失/未知、`id` 非空且唯一、`type` 非法、时间越界或 `startTime` 大于 `deadline`、`leaderElected` 携带 target、其他类型缺失 target、target 不是非空字符串或引用了不存在的客户命令/查询/成员变更 id 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复、`readQueries` 非列表或条目的字段缺失/未知、时间越界、节点未知、id 非法或与客户命令/成员变更/其他查询的 id 重复、`livenessChecks` 非列表或条目的字段缺失/未知、`id` 非空且唯一、`type` 非法、时间越界或 `startTime` 大于 `deadline`、`leaderElected` 携带 target、其他类型缺失 target、target 不是非空字符串或引用了不存在的客户命令/查询/成员变更 id、`preVote` 不是 JSON 布尔值、关闭预投票时在 `messageFaults` 中引用 `preVote` 或 `preVoteReply` 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
 ## explore 子命令
 
@@ -162,7 +171,7 @@ consensus-protocol-lab --help               # 打印用法
 PLAN 是一个 JSON 对象，包含以下四个必填字段，未知字段会被拒绝；另有可选字段 `minimizeFailures`，以及必须同时提供或同时省略的 `eventCandidates` 与 `maxEventFaults`：
 
 - `scenario`（必填）：与 `simulate` 相同的场景对象，但不得包含 `messageFaults` 字段；可保留固定的 `faults` 与 `nodeEvents`。
-- `candidates`（必填）：非空的消息故障规则数组，每项按 `simulate` 的 `messageFaults` 规则原样校验（含对场景节点的引用检查），完整选择器 `(from, to, message, occurrence)` 不得重复。
+- `candidates`（必填）：非空的消息故障规则数组，每项按 `simulate` 的 `messageFaults` 规则原样校验（含对场景节点的引用检查），完整选择器 `(from, to, message, occurrence)` 不得重复；`preVote`/`preVoteReply` 候选仅在场景 `preVote: true` 时合法。
 - `maxFaults`（必填）：零至候选规则数的整数（非布尔），每个组合至多选用的规则数。
 - `maxCases`（必填）：正整数（非布尔），允许的组合总数上限。
 - `minimizeFailures`（可选）：JSON 布尔值，省略时视为 `false`。为 `true` 时，仍按既有顺序枚举并判定全部组合，并为每个 failed case 附加上下文所述的最小复现字段。
@@ -233,6 +242,6 @@ PLAN 文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、`
 
 ## 限制
 
-- 实现 Raft 选主、心跳、日志复制/提交、快照与日志压缩、联合共识（joint consensus）成员变更、基于 `readProbe`/`readReply` 多数确认的只读查询，以及节点崩溃与基于持久化状态的重启恢复。
+- 实现 Raft 选主、心跳、日志复制/提交、快照与日志压缩、联合共识（joint consensus）成员变更、基于 `readProbe`/`readReply` 多数确认的只读查询、可选的预投票（pre-vote）阶段，以及节点崩溃与基于持久化状态的重启恢复。
 - 成员变更采用联合共识两阶段（联合配置项提交后再提交稳定配置项）；learner 先追平日志再进入联合集合；不实现单节点一次多变更等额外成员变更扩展。
 - 仿真不读取墙钟、不使用随机数；持久化为同步建模，不在磁盘上创建任何文件。
