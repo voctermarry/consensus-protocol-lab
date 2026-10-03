@@ -498,3 +498,259 @@ def test_simulate_and_version_are_unchanged(tmp_path, capsys):
     out, err = capsys.readouterr()
     assert code == 0 and err == ""
     assert out.strip() != ""
+
+
+# -- eventCandidates / maxEventFaults -----------------------------------------
+
+
+def _event_plan(**overrides):
+    plan = _base_plan(
+        candidates=[_candidate(91), _candidate(92)],
+        maxFaults=1,
+        eventCandidates=[
+            {"network": {"time": 200, "action": "partition",
+                         "groups": [["a"], ["b", "c"]]}},
+            {"node": {"time": 300, "node": "c", "action": "crash"}},
+        ],
+        maxEventFaults=2,
+    )
+    plan.update(overrides)
+    return plan
+
+
+def test_event_enumeration_is_cartesian_with_message_combos_outer(tmp_path, capsys):
+    # 3 message combinations x 4 event combinations; within each message
+    # combination the empty event combination comes first, then ascending
+    # event counts in numeric lexicographic order.
+    summary = _run_ok(tmp_path, capsys, _event_plan())
+    assert summary["totalCases"] == 12
+    assert [case["caseId"] for case in summary["cases"]] == list(range(12))
+    assert [(case["selected"], case["selectedEvents"]) for case in summary["cases"]] == [
+        ([], []), ([], [0]), ([], [1]), ([], [0, 1]),
+        ([0], []), ([0], [0]), ([0], [1]), ([0], [0, 1]),
+        ([1], []), ([1], [0]), ([1], [1]), ([1], [0, 1]),
+    ]
+    assert summary["passedCases"] + summary["failedCases"] == 12
+
+
+def test_selected_events_are_appended_to_base_collections(tmp_path, capsys):
+    # The base scenario carries a fixed heal and a fixed crash; the selected
+    # candidate partition and crash must show up alongside them.
+    scenario = _base_scenario(
+        faults=[{"time": 400, "action": "heal"}],
+        nodeEvents=[{"time": 250, "node": "b", "action": "crash"}],
+    )
+    plan = _event_plan(scenario=scenario, maxFaults=0)
+    summary = _run_ok(tmp_path, capsys, plan)
+    both = next(c for c in summary["cases"] if c["selectedEvents"] == [0, 1])
+    timeline = both["result"]["timeline"]
+    assert [(e["time"], e["action"]) for e in timeline if e["type"] == "fault"] == [
+        (200, "partition"),
+        (400, "heal"),
+    ]
+    lifecycle = [(e["time"], e["node"], e["action"])
+                 for e in timeline if e["type"] == "nodeLifecycle"]
+    assert (250, "b", "crash") in lifecycle
+    assert (300, "c", "crash") in lifecycle
+
+
+def test_same_timestamp_base_events_run_before_candidates(tmp_path, capsys):
+    # At t=100 the base partition and the base crash precede the candidate
+    # heal and the candidate restart, and the network events precede the
+    # node events.
+    scenario = _base_scenario(
+        duration=300,
+        faults=[{"time": 100, "action": "partition", "groups": [["a"], ["b", "c"]]}],
+        nodeEvents=[{"time": 100, "node": "c", "action": "crash"}],
+    )
+    plan = _event_plan(
+        scenario=scenario,
+        maxFaults=0,
+        eventCandidates=[
+            {"network": {"time": 100, "action": "heal"}},
+            {"node": {"time": 100, "node": "c", "action": "restart"}},
+        ],
+    )
+    summary = _run_ok(tmp_path, capsys, plan)
+    both = next(c for c in summary["cases"] if c["selectedEvents"] == [0, 1])
+    kinds = [
+        (e["type"], e["action"])
+        for e in both["result"]["timeline"]
+        if e["time"] == 100 and e["type"] in ("fault", "nodeLifecycle")
+    ]
+    assert kinds == [
+        ("fault", "partition"),
+        ("fault", "heal"),
+        ("nodeLifecycle", "crash"),
+        ("nodeLifecycle", "restart"),
+    ]
+
+
+def test_max_event_faults_zero_still_marks_cases(tmp_path, capsys):
+    plan = _event_plan(maxEventFaults=0)
+    summary = _run_ok(tmp_path, capsys, plan)
+    assert summary["totalCases"] == 3
+    assert all(case["selectedEvents"] == [] for case in summary["cases"])
+
+
+def test_event_fields_must_be_provided_together(tmp_path, capsys):
+    plan = _base_plan(eventCandidates=[{"network": {"time": 1, "action": "heal"}}])
+    err = _run_error(tmp_path, capsys, plan)
+    assert "provided together" in err
+    err = _run_error(tmp_path, capsys, _base_plan(maxEventFaults=1))
+    assert "provided together" in err
+
+
+def test_event_candidates_structural_validation(tmp_path, capsys):
+    err = _run_error(tmp_path, capsys, _event_plan(eventCandidates="x"))
+    assert "eventCandidates must be a list" in err
+    err = _run_error(tmp_path, capsys, _event_plan(eventCandidates=[]))
+    assert "eventCandidates must not be empty" in err
+    err = _run_error(tmp_path, capsys, _event_plan(eventCandidates=[5]))
+    assert "eventCandidates[0] must be an object" in err
+    err = _run_error(tmp_path, capsys, _event_plan(
+        eventCandidates=[{"network": {"time": 1, "action": "heal"}, "extra": 1}]))
+    assert "unknown field(s): extra" in err
+    err = _run_error(tmp_path, capsys, _event_plan(eventCandidates=[{}]))
+    assert "exactly one of network or node" in err
+    err = _run_error(tmp_path, capsys, _event_plan(eventCandidates=[
+        {"network": {"time": 1, "action": "heal"},
+         "node": {"time": 1, "node": "a", "action": "crash"}},
+    ]))
+    assert "exactly one of network or node" in err
+
+
+def test_max_event_faults_bounds(tmp_path, capsys):
+    err = _run_error(tmp_path, capsys, _event_plan(maxEventFaults=-1))
+    assert "maxEventFaults" in err
+    err = _run_error(tmp_path, capsys, _event_plan(maxEventFaults=True))
+    assert "maxEventFaults must be an integer" in err
+    err = _run_error(tmp_path, capsys, _event_plan(maxEventFaults=3))
+    assert "maxEventFaults must not exceed the number of event candidates" in err
+
+
+def test_event_content_is_validated_before_any_simulation(tmp_path, capsys):
+    # Illegal partition shape, unknown node, out-of-range time and broken
+    # crash/restart alternation in a merged combination are all plan errors.
+    err = _run_error(tmp_path, capsys, _event_plan(eventCandidates=[
+        {"network": {"time": 1, "action": "partition", "groups": [["a"], ["b"]]}},
+    ], maxEventFaults=1))
+    assert "cover every node" in err
+    err = _run_error(tmp_path, capsys, _event_plan(eventCandidates=[
+        {"node": {"time": 1, "node": "zz", "action": "crash"}},
+    ], maxEventFaults=1))
+    assert "unknown node" in err
+    err = _run_error(tmp_path, capsys, _event_plan(eventCandidates=[
+        {"network": {"time": 9999, "action": "heal"}},
+    ], maxEventFaults=0))
+    assert "beyond the simulation duration" in err
+    # Base crash plus a second candidate crash for the same node only breaks
+    # alternation in the merged combination that selects the candidate.
+    scenario = _base_scenario(nodeEvents=[{"time": 1, "node": "a", "action": "crash"}])
+    err = _run_error(tmp_path, capsys, _event_plan(
+        scenario=scenario,
+        eventCandidates=[{"node": {"time": 2, "node": "a", "action": "crash"}}],
+        maxEventFaults=1,
+    ))
+    assert "alternate" in err
+
+
+def test_max_cases_counts_the_full_cartesian_product(tmp_path, capsys):
+    # 3 message combinations x 4 event combinations = 12 cases.
+    err = _run_error(tmp_path, capsys, _event_plan(maxCases=11))
+    assert "combination count 12 exceeds maxCases 11" in err
+    summary = _run_ok(tmp_path, capsys, _event_plan(maxCases=12))
+    assert summary["totalCases"] == 12
+
+
+def _stale_read_event_plan(deadline=125):
+    # 4-node scenario: a leads and commits w1 at t=160; crashing a at 165 or
+    # partitioning it away at 170 both strand the commit, so b's later read
+    # is stale and fails linearizability.
+    scenario = {
+        "nodes": ["a", "b", "c", "d"],
+        "duration": 700,
+        "electionTimeouts": {"a": 80, "b": 150, "c": 200, "d": 250},
+        "heartbeatInterval": 50,
+        "messageDelay": 10,
+        "clientCommands": [{"time": 140, "node": "a", "id": "w1", "command": "x"}],
+        "readQueries": [{"time": 400, "node": "b", "id": "r1"}],
+        "livenessChecks": [
+            {"id": "L1", "type": "leaderElected", "startTime": 0, "deadline": deadline}
+        ],
+    }
+    return {
+        "scenario": scenario,
+        "candidates": [
+            {"from": "a", "to": "b", "message": "heartbeat",
+             "occurrence": 91, "action": "drop"},
+        ],
+        "maxFaults": 0,
+        "maxCases": 100,
+        "minimizeFailures": True,
+        "eventCandidates": [
+            {"node": {"time": 165, "node": "a", "action": "crash"}},
+            {"network": {"time": 170, "action": "partition",
+                         "groups": [["a"], ["b", "c", "d"]]}},
+        ],
+        "maxEventFaults": 2,
+    }
+
+
+def test_minimize_deletes_both_candidate_kinds(tmp_path, capsys):
+    summary = _run_ok(tmp_path, capsys, _stale_read_event_plan())
+    by_events = {tuple(c["selectedEvents"]): c for c in summary["cases"]}
+    assert by_events[()]["status"] == "passed"
+    assert "minimalSelectedEvents" not in by_events[()]
+    for key in ((0,), (1,)):
+        case = by_events[key]
+        assert case["failureReports"] == ["linearizability"]
+        assert case["minimalSelected"] == []
+        assert case["minimalSelectedEvents"] == list(key)
+        assert case["minimalCaseId"] == case["caseId"]
+    pair = by_events[(0, 1)]
+    assert pair["failureReports"] == ["linearizability"]
+    # Both singletons reproduce the pair's exact failureReports; the fewest
+    # total candidates win, ties broken by selected then selectedEvents.
+    assert pair["minimalSelected"] == []
+    assert pair["minimalSelectedEvents"] == [0]
+    assert pair["minimalCaseId"] == by_events[(0,)]["caseId"]
+    # minimalCaseId always references an enumerated case.
+    assert {c["caseId"] for c in summary["cases"]} == {0, 1, 2, 3}
+
+
+def test_minimize_prefers_fewest_total_candidates_across_kinds(tmp_path, capsys):
+    # A message fault and an event each reproduce the same liveness failure;
+    # a case combining both collapses onto the single message fault because
+    # one candidate beats two, regardless of kind.
+    scenario = _base_scenario(
+        livenessChecks=[
+            {"id": "L1", "type": "leaderElected", "startTime": 0, "deadline": 50}
+        ]
+    )
+    plan = _base_plan(
+        scenario=scenario,
+        candidates=[_candidate(1)],
+        maxFaults=1,
+        minimizeFailures=True,
+        eventCandidates=[{"node": {"time": 10, "node": "a", "action": "crash"}}],
+        maxEventFaults=1,
+    )
+    summary = _run_ok(tmp_path, capsys, plan)
+    assert summary["failedCases"] == 4
+    for case in summary["cases"]:
+        assert case["failureReports"] == ["liveness"]
+        assert case["minimalSelected"] == []
+        assert case["minimalSelectedEvents"] == []
+        assert case["minimalCaseId"] == 0
+
+
+def test_legacy_plan_output_is_byte_identical_without_event_fields(tmp_path, capsys):
+    # Omitting eventCandidates and maxEventFaults keeps the legacy output;
+    # in particular cases carry no selectedEvents key.
+    plan = _base_plan(candidates=[_candidate(1), _candidate(2)], maxFaults=2,
+                      minimizeFailures=True)
+    summary = _run_ok(tmp_path, capsys, plan)
+    for case in summary["cases"]:
+        assert "selectedEvents" not in case
+        assert "minimalSelectedEvents" not in case

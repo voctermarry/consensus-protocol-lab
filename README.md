@@ -155,23 +155,27 @@ consensus-protocol-lab --help               # 打印用法
 
 ## explore 子命令
 
-`explore` 读取一个 UTF-8 JSON 的 PLAN 文件，在一个基础场景上有界枚举消息故障规则的组合，对每个组合独立运行一次确定性仿真，从而生成可复现的反例。它不读取墙钟、不使用随机数、不创建任何文件，同一 PLAN 的输出逐字节一致。
+`explore` 读取一个 UTF-8 JSON 的 PLAN 文件，在一个基础场景上有界枚举消息故障规则的组合（可选地再与网络分区、节点崩溃事件组合取笛卡尔积），对每个组合独立运行一次确定性仿真，从而生成可复现的反例。它不读取墙钟、不使用随机数、不创建任何文件，同一 PLAN 的输出逐字节一致。
 
 ### PLAN 字段
 
-PLAN 是一个 JSON 对象，包含以下四个必填字段，未知字段会被拒绝；另有可选字段 `minimizeFailures`：
+PLAN 是一个 JSON 对象，包含以下四个必填字段，未知字段会被拒绝；另有可选字段 `minimizeFailures`，以及必须同时提供或同时省略的 `eventCandidates` 与 `maxEventFaults`：
 
-- `scenario`（必填）：与 `simulate` 相同的场景对象，但不得包含 `messageFaults` 字段。
+- `scenario`（必填）：与 `simulate` 相同的场景对象，但不得包含 `messageFaults` 字段；可保留固定的 `faults` 与 `nodeEvents`。
 - `candidates`（必填）：非空的消息故障规则数组，每项按 `simulate` 的 `messageFaults` 规则原样校验（含对场景节点的引用检查），完整选择器 `(from, to, message, occurrence)` 不得重复。
 - `maxFaults`（必填）：零至候选规则数的整数（非布尔），每个组合至多选用的规则数。
 - `maxCases`（必填）：正整数（非布尔），允许的组合总数上限。
 - `minimizeFailures`（可选）：JSON 布尔值，省略时视为 `false`。为 `true` 时，仍按既有顺序枚举并判定全部组合，并为每个 failed case 附加上下文所述的最小复现字段。
+- `eventCandidates`（可选，必须与 `maxEventFaults` 同时提供）：非空的事件候选数组，每项是一个只含 `network` 或 `node` 之一的对象；`network` 的值按 `simulate` 的 `faults` 条目约束校验，`node` 的值按 `nodeEvents` 条目约束校验。
+- `maxEventFaults`（可选，必须与 `eventCandidates` 同时提供）：零至事件候选数的整数（非布尔），每个组合至多选用的事件数。
 
 ### 枚举与执行
 
 - 先运行不选任何规则的组合，再按规则数从 1 到 `maxFaults` 升序枚举；同一规则数内按候选下标组合的数值字典序排列（`itertools.combinations` 顺序）。
-- 组合总数（即 `k` 从 0 到 `maxFaults` 的 `C(候选数, k)` 之和）超过 `maxCases` 时，在任何仿真开始之前失败。
-- 每个组合独立运行一次仿真：选中的规则按原候选下标顺序注入为该次仿真的 `messageFaults`，未命中发送的规则保持原语义（不报错、不产生输出）；timeline 中 `messageFault` 事件的 `rule` 字段仍为规则在 `candidates` 中的原下标。
+- 提供事件候选时，枚举为消息故障组合与事件组合的笛卡尔积：消息组合保持上述顺序作为外层，每组内先执行空事件组合，再按事件数升序及候选下标数值字典序执行事件组合。
+- 组合总数（消息组合数乘以事件组合数，即两边各自 `C(候选数, k)` 之和的乘积）超过 `maxCases` 时，在任何仿真开始之前失败。
+- 每个组合独立运行一次仿真：选中的规则按原候选下标顺序注入为该次仿真的 `messageFaults`，未命中发送的规则保持原语义（不报错、不产生输出）；timeline 中 `messageFault` 事件的 `rule` 字段仍为规则在 `candidates` 中的原下标。选中的事件按候选下标顺序追加到基础场景的 `faults` 或 `nodeEvents`：同一时刻的同类事件先处理基础项再按候选下标处理，网络事件仍先于节点事件。
+- 所有合并场景（基础场景叠加各组合选中的事件）都在任何仿真之前校验；任一组合的分区非法、节点事件未从 `crash` 开始严格交替、时间或节点引用非法，整个 PLAN 即失败。
 - 某个组合的失败不阻止后续组合运行；全部组合完成后退出码为 0。
 
 ### 输出
@@ -182,16 +186,18 @@ PLAN 是一个 JSON 对象，包含以下四个必填字段，未知字段会被
 - `cases`：按枚举顺序排列的数组，每项依次包含：
   - `caseId`：从零开始递增的序号。
   - `selected`：该组合选中的候选下标数组（空数组表示无故障组合）。
+  - `selectedEvents`（仅在提供 `eventCandidates` 与 `maxEventFaults` 时出现）：该组合选中的事件候选下标数组（空数组表示无事件组合）。
   - `status`：`passed` 或 `failed`。结果的 `electionSafety`、`logMatching`、`stateMachineSafety`、`linearizability`、`liveness` 报告中任一 `violations` 非空即为 `failed`，否则为 `passed`；场景未启用的报告不参与判断。
   - `result`：该次仿真的完整结果，与 `simulate` 的输出结构相同（含 `timeline`）。
-  - 当 `minimizeFailures` 为 `true` 时，每个 failed case 额外依次包含以下三个字段；passed case 不出现它们，组合范围与 `cases` 顺序不因最小化改变：
+  - 当 `minimizeFailures` 为 `true` 时，每个 failed case 额外依次包含以下字段；passed case 不出现它们，组合范围与 `cases` 顺序不因最小化改变：
     - `failureReports`：按 `electionSafety`、`logMatching`、`stateMachineSafety`、`linearizability`、`liveness` 的既有检查优先级，列出该 case 中实际存在且 `violations` 非空的报告名；场景未启用而缺席的报告不列入。
-    - `minimalSelected`：仅从该 case 的候选下标中删除规则后，仍与原 case 具有完全相同 `failureReports` 的规则数最少组合；规则数相同时取候选下标数组数值字典序最小者。删除故障后变为 passed 或只剩其他违例的组合不得选为最小复现。
-    - `minimalCaseId`：该最小组合在 `cases` 中对应的既有 case 的 `caseId`；其复现信息（完整 timeline 与报告）以该既有 case 为准，不另造仿真结果。无故障 case 若已具有相同失败签名，即为包含它且签名相同的失败 case 的最小结果（`minimalSelected` 为 `[]`）。最小化引用不额外运行仿真，因此不计入 `maxCases`。
+    - `minimalSelected`：仅从该 case 的两类候选下标中删除项后，仍与原 case 具有完全相同 `failureReports` 的候选总数（消息规则数加事件数）最少组合的消息规则下标；候选总数相同时先取 `selected` 数值字典序最小者，再取 `selectedEvents` 数值字典序最小者。删除候选后变为 passed 或只剩其他违例的组合不得选为最小复现。
+    - `minimalSelectedEvents`（仅在提供 `eventCandidates` 与 `maxEventFaults` 时出现）：该最小组合的事件候选下标。
+    - `minimalCaseId`：该最小组合在 `cases` 中对应的既有 case 的 `caseId`；其复现信息（完整 timeline 与报告）以该既有 case 为准，不另造仿真结果。无故障 case 若已具有相同失败签名，即为包含它且签名相同的失败 case 的最小结果（`minimalSelected` 为 `[]`，启用事件时 `minimalSelectedEvents` 也为 `[]`）。最小化引用不额外运行仿真，因此不计入 `maxCases`。
 
 ### 错误
 
-PLAN 文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、`scenario` 不是对象或含有 `messageFaults`、场景或候选规则校验失败、完整选择器重复、`candidates` 非列表或为空、`maxFaults`/`maxCases` 为布尔值、非整数或越界、`minimizeFailures` 不是 JSON 布尔值、组合总数超过 `maxCases` 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+PLAN 文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、`scenario` 不是对象或含有 `messageFaults`、场景或候选规则校验失败、完整选择器重复、`candidates` 非列表或为空、`maxFaults`/`maxCases` 为布尔值、非整数或越界、`minimizeFailures` 不是 JSON 布尔值、`eventCandidates` 与 `maxEventFaults` 只出现其一、`eventCandidates` 非列表或为空、条目不是只含 `network` 或 `node` 之一的对象、事件内容或任一合并场景校验失败、`maxEventFaults` 为布尔值、非整数或越界、组合总数超过 `maxCases` 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。`eventCandidates` 与 `maxEventFaults` 同时省略时，合法旧 PLAN 的标准输出、组合顺序、最小化字段与退出码逐字节不变。
 
 ## replay 子命令
 
