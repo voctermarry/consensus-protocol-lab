@@ -12,6 +12,10 @@ import json
 ROLE_FOLLOWER = "follower"
 ROLE_CANDIDATE = "candidate"
 ROLE_LEADER = "leader"
+# Optional pre-vote phase (preVote: true): a node that times out first
+# becomes a preCandidate and only starts a real election after a majority
+# of pre-vote grants. The role is volatile and never persisted.
+ROLE_PRE_CANDIDATE = "preCandidate"
 
 # Event kinds, processed in this order when they share a timestamp.
 _KIND_FAULT = 0
@@ -53,6 +57,7 @@ _TOP_LEVEL_FIELDS = {
     "messageFaults",
     "readQueries",
     "livenessChecks",
+    "preVote",
 }
 _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "faults",
@@ -64,6 +69,7 @@ _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "messageFaults",
     "readQueries",
     "livenessChecks",
+    "preVote",
 }
 _FAULT_FIELDS = {"time", "action", "groups"}
 _MESSAGE_FAULT_FIELDS = {"from", "to", "message", "occurrence", "action", "delay"}
@@ -79,6 +85,9 @@ _MESSAGE_KINDS = (
     "readProbe",
     "readReply",
 )
+# Message kinds that only exist when the preVote option is enabled;
+# referencing them with the feature off is an invalid scenario.
+_PRE_VOTE_MESSAGE_KINDS = ("preVote", "preVoteReply")
 _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 _NODE_EVENT_FIELDS = {"time", "node", "action"}
 _MEMBERSHIP_CHANGE_FIELDS = {"time", "node", "id", "action", "member"}
@@ -145,6 +154,10 @@ def parse_scenario(raw: object) -> dict:
     duration = _require_int(raw["duration"], "duration", 0)
     heartbeat = _require_int(raw["heartbeatInterval"], "heartbeatInterval", 1)
     delay = _require_int(raw["messageDelay"], "messageDelay", 0)
+
+    pre_vote = raw.get("preVote", False)
+    if not isinstance(pre_vote, bool):
+        raise ScenarioError("preVote must be a boolean")
 
     timeouts_raw = raw["electionTimeouts"]
     if _is_int(timeouts_raw):
@@ -241,9 +254,16 @@ def parse_scenario(raw: object) -> dict:
         if src == dst:
             raise ScenarioError(f"{label}.from and {label}.to must be different nodes")
         kind = message_fault["message"]
-        if kind not in _MESSAGE_KINDS:
+        if kind in _PRE_VOTE_MESSAGE_KINDS and not pre_vote:
             raise ScenarioError(
-                f"{label}.message must be one of: {', '.join(_MESSAGE_KINDS)}"
+                f"{label}.message {kind} requires preVote to be enabled"
+            )
+        allowed_kinds = (
+            _MESSAGE_KINDS + _PRE_VOTE_MESSAGE_KINDS if pre_vote else _MESSAGE_KINDS
+        )
+        if kind not in allowed_kinds:
+            raise ScenarioError(
+                f"{label}.message must be one of: {', '.join(allowed_kinds)}"
             )
         occurrence = _require_int(message_fault["occurrence"], f"{label}.occurrence", 1)
         action = message_fault["action"]
@@ -547,6 +567,7 @@ def parse_scenario(raw: object) -> dict:
         "electionTimeouts": timeouts,
         "heartbeatInterval": heartbeat,
         "messageDelay": delay,
+        "preVote": pre_vote,
         "faults": normalized_faults,
         "messageFaults": normalized_message_faults,
         "clientCommands": normalized_commands,
@@ -582,6 +603,11 @@ class _Node:
         "match_index",
         "online",
         "restart_count",
+        "pre_vote_round",
+        "pre_votes",
+        "pre_vote_prospective_term",
+        "leader_contact_time",
+        "leader_contact_term",
     )
 
     def __init__(self) -> None:
@@ -616,6 +642,19 @@ class _Node:
         # restart. Everything else is volatile and is reset on restart.
         self.online = True
         self.restart_count = 0
+        # Pre-vote state (only meaningful with the preVote option): the
+        # current round counter, the grants collected in it and the term the
+        # node would campaign at. Volatile by definition: pre-vote state is
+        # never persisted and is cleared on restart.
+        self.pre_vote_round = 0
+        self.pre_votes: set[str] = set()
+        self.pre_vote_prospective_term = 0
+        # Virtual time and term of the most recently accepted current-term
+        # leader message (heartbeat, appendEntries or installSnapshot);
+        # contact_term -1 marks "no accepted leader message yet". This is
+        # volatile timing state used only by the pre-vote grant check.
+        self.leader_contact_time = 0
+        self.leader_contact_term = -1
 
     def last_log_index(self) -> int:
         return self.snapshot_index + len(self.log)
@@ -677,6 +716,7 @@ class _Simulator:
         self.timeouts: dict[str, int] = config["electionTimeouts"]
         self.heartbeat_interval: int = config["heartbeatInterval"]
         self.delay: int = config["messageDelay"]
+        self.pre_vote: bool = config["preVote"]
         self.faults: list[dict] = config["faults"]
         # Per-message fault rules, keyed by the full selector
         # (from, to, message, occurrence); the per-(from, to, message) send
@@ -948,6 +988,7 @@ class _Simulator:
         st.voted_for = None
         st.known_leader = None
         st.votes = set()
+        st.pre_votes = set()
         st.next_index = {}
         st.match_index = {}
         self._reset_timeout(name)
@@ -955,7 +996,7 @@ class _Simulator:
         # A deposed leader can no longer vouch for reads it accepted.
         self._abandon_reads(name)
 
-    def _start_election(self, name: str) -> None:
+    def _start_election(self, name: str, reason: str = "electionTimeout") -> None:
         st = self.state[name]
         # The election is decided under the configuration in place just
         # before the candidate appends anything (joint configs require
@@ -969,7 +1010,7 @@ class _Simulator:
         st.next_index = {}
         st.match_index = {}
         self._reset_timeout(name)
-        self._record_state_change(name, "electionTimeout")
+        self._record_state_change(name, reason)
         for peer in self.node_names:
             if peer != name and self._is_voter(peer, config):
                 self._send(
@@ -978,6 +1019,52 @@ class _Simulator:
                     {
                         "kind": "requestVote",
                         "term": st.term,
+                        "lastLogIndex": st.last_log_index(),
+                        "lastLogTerm": st.last_log_term(),
+                    },
+                )
+
+    def _start_pre_vote(self, name: str) -> None:
+        """Enter the pre-vote phase instead of a real election: the node
+        becomes a preCandidate for ``term + 1`` WITHOUT incrementing or
+        persisting its term and without touching votedFor, and solicits
+        pre-votes for that prospective term. Only a majority of grants in
+        this very round (see _handle_pre_vote_reply) lets it raise its term
+        and start the real election."""
+        st = self.state[name]
+        # The pre-vote is decided under the configuration in place just
+        # before the node would append anything (joint configs require
+        # majorities of both constituent sets).
+        config = st.latest_config(self.initial_config)
+        st.role = ROLE_PRE_CANDIDATE
+        st.pre_vote_round += 1
+        st.pre_vote_prospective_term = st.term + 1
+        st.pre_votes = {name}
+        st.known_leader = None
+        st.next_index = {}
+        st.match_index = {}
+        # Arm the timer for the next round: if this pre-vote fails, the
+        # following election timeout opens a fresh round.
+        self._reset_timeout(name)
+        self._record({
+            "type": "stateChange",
+            "node": name,
+            "term": st.term,
+            "role": st.role,
+            "reason": "electionTimeout",
+            "round": st.pre_vote_round,
+            "prospectiveTerm": st.pre_vote_prospective_term,
+        })
+        for peer in self.node_names:
+            if peer != name and self._is_voter(peer, config):
+                self._send(
+                    name,
+                    peer,
+                    {
+                        "kind": "preVote",
+                        "term": st.term,
+                        "prospectiveTerm": st.pre_vote_prospective_term,
+                        "round": st.pre_vote_round,
                         "lastLogIndex": st.last_log_index(),
                         "lastLogTerm": st.last_log_term(),
                     },
@@ -1049,10 +1136,19 @@ class _Simulator:
     # -- messages -----------------------------------------------------------
 
     @staticmethod
-    def _query_id_field(msg: dict) -> dict:
-        """Read-confirmation messages (readProbe/readReply) carry the query id
-        into their timeline entries; no other message kind has one."""
-        return {"id": msg["id"]} if "id" in msg else {}
+    def _message_context_fields(msg: dict) -> dict:
+        """Extra identifying fields copied into a message's timeline entries:
+        read-confirmation messages (readProbe/readReply) carry the query id;
+        pre-vote messages (preVote/preVoteReply) carry the round and the
+        prospective term. No other message kind has such fields."""
+        extra = {}
+        if "id" in msg:
+            extra["id"] = msg["id"]
+        if "round" in msg:
+            extra["round"] = msg["round"]
+        if "prospectiveTerm" in msg:
+            extra["prospectiveTerm"] = msg["prospectiveTerm"]
+        return extra
 
     def _send(self, src: str, dst: str, msg: dict) -> None:
         self._record({
@@ -1061,7 +1157,7 @@ class _Simulator:
             "peer": dst,
             "message": msg["kind"],
             "term": msg["term"],
-            **self._query_id_field(msg),
+            **self._message_context_fields(msg),
         })
         self.send_counter += 1
         envelope = {**msg, "src": src, "dst": dst}
@@ -1177,7 +1273,7 @@ class _Simulator:
                 "peer": src,
                 "message": msg["kind"],
                 "term": msg["term"],
-                **self._query_id_field(msg),
+                **self._message_context_fields(msg),
                 "result": "dropped",
                 "reason": "messageFault",
             })
@@ -1192,7 +1288,7 @@ class _Simulator:
                 "peer": src,
                 "message": msg["kind"],
                 "term": msg["term"],
-                **self._query_id_field(msg),
+                **self._message_context_fields(msg),
                 "result": "dropped",
                 "reason": "nodeDown",
             })
@@ -1204,7 +1300,7 @@ class _Simulator:
                 "peer": src,
                 "message": msg["kind"],
                 "term": msg["term"],
-                **self._query_id_field(msg),
+                **self._message_context_fields(msg),
                 "result": "dropped",
                 "reason": "partition",
             })
@@ -1214,6 +1310,10 @@ class _Simulator:
             self._handle_request_vote(msg)
         elif kind == "voteReply":
             self._handle_vote_reply(msg)
+        elif kind == "preVote":
+            self._handle_pre_vote(msg)
+        elif kind == "preVoteReply":
+            self._handle_pre_vote_reply(msg)
         elif kind == "heartbeat":
             self._handle_heartbeat(msg)
         elif kind == "appendEntries":
@@ -1291,6 +1391,122 @@ class _Simulator:
         elif elected:
             self._become_leader(dst, election_config)
 
+    # -- pre-vote -------------------------------------------------------------
+
+    def _pre_vote_deadline_reached(self, name: str) -> bool:
+        """Whether the node's local election deadline — measured from the
+        most recently accepted current-term heartbeat, appendEntries or
+        installSnapshot — has arrived. An active leader continuously hears
+        from itself, so its deadline never arrives; with no accepted
+        current-term leader message on record the deadline counts as
+        reached (otherwise a fresh cluster could never elect anyone)."""
+        st = self.state[name]
+        if st.role == ROLE_LEADER:
+            return False
+        if st.leader_contact_term != st.term:
+            return True
+        return self.now >= st.leader_contact_time + self.timeouts[name]
+
+    def _handle_pre_vote(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        up_to_date = (
+            msg["lastLogTerm"] > st.last_log_term()
+            or (
+                msg["lastLogTerm"] == st.last_log_term()
+                and msg["lastLogIndex"] >= st.last_log_index()
+            )
+        )
+        # A pre-vote request is granted only when the receiver may itself
+        # vote, the prospective term is at least the local term plus one,
+        # the requester's log is at least as up to date, and the local
+        # election deadline has arrived. The request never changes the
+        # receiver's term, vote or election deadline.
+        granted = (
+            self._can_vote(dst)
+            and msg["prospectiveTerm"] >= st.term + 1
+            and up_to_date
+            and self._pre_vote_deadline_reached(dst)
+        )
+        self._record({
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "preVote",
+            "term": msg["term"],
+            "prospectiveTerm": msg["prospectiveTerm"],
+            "round": msg["round"],
+            "result": "delivered",
+            "detail": "granted" if granted else "rejected",
+        })
+        self._send(
+            dst,
+            src,
+            {
+                "kind": "preVoteReply",
+                "term": st.term,
+                "prospectiveTerm": msg["prospectiveTerm"],
+                "round": msg["round"],
+                "granted": granted,
+            },
+        )
+
+    def _handle_pre_vote_reply(self, msg: dict) -> None:
+        src, dst = msg["src"], msg["dst"]
+        st = self.state[dst]
+        if msg["term"] > st.term:
+            # A higher actual term cancels the round like any other
+            # higher-term message.
+            self._record({
+                "type": "messageResult",
+                "node": dst,
+                "peer": src,
+                "message": "preVoteReply",
+                "term": msg["term"],
+                "prospectiveTerm": msg["prospectiveTerm"],
+                "round": msg["round"],
+                "result": "delivered",
+                "detail": "higherTerm",
+            })
+            self._become_follower(dst, msg["term"], "higherTermMessage")
+            return
+        # Only a reply to the very round still in flight counts: the node
+        # must still be an eligible preCandidate whose term has not changed
+        # since the round started. Anything else (a late reply from an old
+        # round, or a reply arriving after the node moved on) is stale.
+        matched = (
+            st.role == ROLE_PRE_CANDIDATE
+            and msg["round"] == st.pre_vote_round
+            and msg["prospectiveTerm"] == st.pre_vote_prospective_term
+            and self._can_vote(dst)
+        )
+        elected = False
+        if matched and msg["granted"]:
+            st.pre_votes.add(src)
+            detail = "granted"
+            elected = self._has_vote_majorities(
+                dst, st.pre_votes, st.latest_config(self.initial_config)
+            )
+        elif matched:
+            detail = "rejected"
+        else:
+            detail = "staleRound"
+        self._record({
+            "type": "messageResult",
+            "node": dst,
+            "peer": src,
+            "message": "preVoteReply",
+            "term": msg["term"],
+            "prospectiveTerm": msg["prospectiveTerm"],
+            "round": msg["round"],
+            "result": "delivered",
+            "detail": detail,
+        })
+        if elected:
+            # The pre-vote majority holds: raise the term to the
+            # prospective term and start the real election.
+            self._start_election(dst, "preVoteMajority")
+
     def _handle_heartbeat(self, msg: dict) -> None:
         src, dst = msg["src"], msg["dst"]
         st = self.state[dst]
@@ -1306,6 +1522,8 @@ class _Simulator:
         })
         if not accepted:
             return
+        st.leader_contact_time = self.now
+        st.leader_contact_term = msg["term"]
         if msg["term"] > st.term or st.role != ROLE_FOLLOWER:
             self._become_follower(dst, msg["term"], "heartbeat")
         else:
@@ -1336,6 +1554,8 @@ class _Simulator:
             )
             return
 
+        st.leader_contact_time = self.now
+        st.leader_contact_term = msg["term"]
         if msg["term"] > st.term or st.role != ROLE_FOLLOWER:
             self._become_follower(dst, msg["term"], "appendEntries")
         else:
@@ -1478,6 +1698,8 @@ class _Simulator:
             )
             return
 
+        st.leader_contact_time = self.now
+        st.leader_contact_term = msg["term"]
         if msg["term"] > st.term or st.role != ROLE_FOLLOWER:
             self._become_follower(dst, msg["term"], "installSnapshot")
         else:
@@ -2384,7 +2606,14 @@ class _Simulator:
             # election.
             return
         self._record({"type": "timeout", "node": name, "term": st.term, "reason": "electionTimeout"})
-        self._start_election(name)
+        if self.pre_vote:
+            # With the pre-vote option every election timeout — a
+            # follower's first one or the expiry of a failed
+            # pre-vote/election round — opens a fresh pre-vote round
+            # instead of raising the term directly.
+            self._start_pre_vote(name)
+        else:
+            self._start_election(name)
 
     def _on_heartbeat(self, name: str, term: int) -> None:
         st = self.state[name]
@@ -2417,6 +2646,13 @@ class _Simulator:
         st.votes = set()
         st.next_index = {}
         st.match_index = {}
+        # Pre-vote state is never persisted: the node comes back with no
+        # round in flight and waits for a fresh election timeout.
+        st.pre_vote_round = 0
+        st.pre_votes = set()
+        st.pre_vote_prospective_term = 0
+        st.leader_contact_time = 0
+        st.leader_contact_term = -1
         self._reset_timeout(name)
         self._record({"type": "nodeLifecycle", "node": name, "action": "restart"})
 
