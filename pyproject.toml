@@ -16,4 +16,4 @@ dev = ["pytest>=8"]
 consensus-protocol-lab = "consensus_lab.cli:main"
 
 [tool.setuptools]
-packages = ["consensus_lab"]
+packages = ["consensus_lab", "consensus_lab.kernel"]

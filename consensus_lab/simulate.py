@@ -5,10 +5,11 @@ never uses randomness, so identical input produces byte-identical output.
 
 The core execution path is split by responsibility: scenario normalization
 (:mod:`.scenario`), the deterministic event queue (:mod:`.events`), network
-delivery and fault determination (:mod:`.network`), node state transitions
-(:mod:`.protocol`) and final report generation (:mod:`.report`). The
-``simulate``, ``explore`` and ``replay`` entry points all run through the
-single :class:`_Simulator` core below.
+delivery and fault determination (:mod:`.network`), the protocol event-
+handling kernel split into independent responsibilities (:mod:`.kernel`) and
+final report generation (:mod:`.report`). The ``simulate``, ``explore`` and
+``replay`` entry points all run through the single :class:`_Simulator` core
+below.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from .node import (
     ROLE_PRECANDIDATE,
     _Node,
 )
-from .protocol import _Protocol
+from .kernel import _Protocol
 from .report import build_report
 from .scenario import ScenarioError, _is_int, _require_int, parse_scenario
 
