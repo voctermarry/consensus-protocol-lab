@@ -488,6 +488,85 @@ def test_replay_rejects_nonstandard_json_numbers(tmp_path, capsys):
         assert err.count("\n") == 1, literal
 
 
+def test_replay_rejects_non_finite_in_result_with_named_prefix(tmp_path, capsys):
+    scenario_path = _write(tmp_path, "scenario.json", _base_scenario())
+    for literal in (
+        b'{"x": NaN}',
+        b'{"x": Infinity}',
+        b'{"x": -Infinity}',
+        b'{"x": 1e999}',
+        b'{"x": -1e999}',
+        b'{"a": [1, {"b": {"c": [1e400]}}]}',
+    ):
+        result_path = _write(tmp_path, "result.json", None, raw=literal)
+        code, out, err = _replay(capsys, scenario_path, result_path)
+        assert code == 2, literal
+        assert out == "", literal
+        assert err.startswith("error: invalid JSON in result file:"), literal
+        assert "non-finite" in err, literal
+        assert err.count("\n") == 1, literal
+
+
+def test_replay_rejects_non_finite_in_scenario(tmp_path, capsys):
+    result_path = _write(tmp_path, "result.json", {})
+    valid_prefix = (
+        b'{"nodes":["a","b","c"],"duration":50,'
+        b'"electionTimeouts":{"a":100,"b":150,"c":200},'
+        b'"heartbeatInterval":50,"messageDelay":'
+    )
+    for token in (b"NaN", b"Infinity", b"-Infinity", b"1e999", b"-1e999"):
+        scenario_path = _write(tmp_path, "scenario.json", None, raw=valid_prefix + token + b"}")
+        code, out, err = _replay(capsys, scenario_path, result_path)
+        assert code == 2, token
+        assert out == "", token
+        assert err.startswith("error: invalid JSON in scenario file:"), token
+        assert "non-finite" in err, token
+        assert err.count("\n") == 1, token
+
+
+def test_replay_rejects_non_finite_hidden_in_scenario_command(tmp_path, capsys):
+    result_path = _write(tmp_path, "result.json", {})
+    raw = (
+        b'{"nodes":["a","b","c"],"duration":50,'
+        b'"electionTimeouts":{"a":100,"b":150,"c":200},'
+        b'"heartbeatInterval":50,"messageDelay":10,'
+        b'"clientCommands":[{"time":1,"node":"a","id":"x","command":[1e999]}]}'
+    )
+    scenario_path = _write(tmp_path, "scenario.json", None, raw=raw)
+    code, out, err = _replay(capsys, scenario_path, result_path)
+    assert code == 2
+    assert out == ""
+    assert err.startswith("error: invalid JSON in scenario file:")
+    assert "non-finite" in err
+    assert err.count("\n") == 1
+
+
+def test_replay_both_inputs_non_finite_reports_scenario_first(tmp_path, capsys):
+    # The established read order is scenario then result; the scenario error
+    # is the only one reported even when both files are invalid.
+    scenario_path = _write(tmp_path, "scenario.json", None, raw=b'{"x": NaN}')
+    result_path = _write(tmp_path, "result.json", None, raw=b'{"x": Infinity}')
+    code, out, err = _replay(capsys, scenario_path, result_path)
+    assert code == 2
+    assert out == ""
+    assert err.startswith("error: invalid JSON in scenario file:")
+    assert "non-finite" in err
+    assert err.count("\n") == 1
+
+
+def test_replay_accepts_nan_like_strings_and_keys_in_result(tmp_path, capsys):
+    scenario_path = _write(tmp_path, "scenario.json", _base_scenario())
+    # String values and object keys named NaN/Infinity are ordinary JSON; the
+    # file is valid, so this is a field mismatch (exit 1), not a JSON error.
+    result_path = _write(
+        tmp_path, "result.json", {"NaN": "NaN", "Infinity": ["Infinity", "-Infinity"]}
+    )
+    code, out, err = _replay(capsys, scenario_path, result_path)
+    assert code == 1
+    assert err == ""
+    assert json.loads(out)["status"] == "mismatched"
+
+
 def test_replay_does_not_mutate_files(tmp_path, capsys):
     scenario_path, result_path, _ = _simulate_to_file(
         tmp_path, capsys, _base_scenario()

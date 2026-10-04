@@ -185,6 +185,65 @@ def test_non_utf8_file(tmp_path, capsys):
     assert err.startswith("error: ")
 
 
+def test_rejects_non_finite_numbers(tmp_path, capsys):
+    # Bare non-standard tokens at the top level and hidden at arbitrary depth
+    # inside a client command are both rejected before validation starts.
+    nested_templates = [
+        b'{"nodes":["a","b","c"],"duration":50,'
+        b'"electionTimeouts":{"a":100,"b":150,"c":200},'
+        b'"heartbeatInterval":50,"messageDelay":%s}',
+        b'{"nodes":["a","b","c"],"duration":50,'
+        b'"electionTimeouts":{"a":100,"b":150,"c":200},'
+        b'"heartbeatInterval":50,"messageDelay":10,'
+        b'"clientCommands":[{"time":1,"node":"a","id":"x","command":{"v":[%s]}}]}',
+    ]
+    for template in nested_templates:
+        for token in (b"NaN", b"Infinity", b"-Infinity", b"1e999", b"-1e999"):
+            path = tmp_path / "bad.json"
+            path.write_bytes(template % token)
+            code = main(["simulate", str(path)])
+            out, err = capsys.readouterr()
+            assert code == 2, token
+            assert out == "", token
+            assert err.startswith("error: invalid JSON:"), token
+            assert "non-finite" in err, token
+            assert err.count("\n") == 1, token
+
+
+def test_nan_like_strings_and_keys_are_plain_json(tmp_path, capsys):
+    scenario = _base_scenario(
+        clientCommands=[
+            {
+                "time": 1,
+                "node": "a",
+                "id": "x",
+                "command": {
+                    "NaN": "NaN",
+                    "Infinity": ["Infinity", "-Infinity"],
+                    "-Infinity": {"Infinity": 3},
+                },
+            }
+        ]
+    )
+    code, out, err = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)  # valid standard JSON on stdout
+
+
+def test_finite_number_shapes_accepted(tmp_path, capsys):
+    scenario = _base_scenario(
+        clientCommands=[
+            {"time": 1, "node": "a", "id": "x",
+             "command": [0, -0, 1, -2, 3.5, -0.25, 1e2, 2.5e-1]}
+        ]
+    )
+    code, out, err = _run(tmp_path, capsys, scenario)
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)
+
+
 def test_version_and_help_preserved(capsys):
     assert main(["version"]) == 0
     out, _ = capsys.readouterr()

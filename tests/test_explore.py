@@ -754,3 +754,42 @@ def test_legacy_plan_output_is_byte_identical_without_event_fields(tmp_path, cap
     for case in summary["cases"]:
         assert "selectedEvents" not in case
         assert "minimalSelectedEvents" not in case
+
+
+# -- strict JSON boundary ---------------------------------------------------
+
+
+def _run_raw(tmp_path, capsys, raw):
+    path = tmp_path / "plan.json"
+    path.write_bytes(raw)
+    code = main(["explore", str(path)])
+    out, err = capsys.readouterr()
+    return code, out, err
+
+
+def test_explore_rejects_non_finite_numbers(tmp_path, capsys):
+    template = (
+        b'{"scenario":{"nodes":["a","b","c"],"duration":50,'
+        b'"electionTimeouts":{"a":100,"b":150,"c":200},'
+        b'"heartbeatInterval":50,"messageDelay":10,'
+        b'"clientCommands":[{"time":1,"node":"a","id":"x","command":{"v":[%s]}}]},'
+        b'"candidates":[{"from":"a","to":"b","message":"heartbeat",'
+        b'"occurrence":1,"action":"drop"}],'
+        b'"maxFaults":0,"maxCases":10}'
+    )
+    for token in (b"NaN", b"Infinity", b"-Infinity", b"1e999", b"-1e999"):
+        code, out, err = _run_raw(tmp_path, capsys, template % token)
+        assert code == 2, token
+        assert out == "", token
+        assert err.startswith("error: invalid JSON:"), token
+        assert "non-finite" in err, token
+        assert err.count("\n") == 1, token
+
+
+def test_explore_accepts_nan_like_strings_and_keys(tmp_path, capsys):
+    plan = _base_plan()
+    plan["scenario"]["clientCommands"] = [
+        {"time": 1, "node": "a", "id": "x",
+         "command": {"NaN": "Infinity", "-Infinity": ["NaN"]}}
+    ]
+    _run_ok(tmp_path, capsys, plan)
