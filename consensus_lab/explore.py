@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from itertools import combinations
 
-from .simulate import ScenarioError, _Simulator, _require_int, parse_scenario
+from .engine import execute_scenario
+from .scenario import ScenarioError, _require_int, parse_scenario
 
 _PLAN_FIELDS = {
     "scenario",
@@ -199,7 +200,7 @@ def run_explore(raw: object) -> dict:
         for event_index, event_selected in enumerate(event_combos):
             case_config = dict(event_configs[event_index])
             case_config["messageFaults"] = [rules[i] for i in selected]
-            result = _Simulator(case_config).run()
+            result = execute_scenario(case_config)
             signature = _failure_signature(result)
             if signature:
                 status = "failed"
