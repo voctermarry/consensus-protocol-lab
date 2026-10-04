@@ -6,7 +6,8 @@ never uses randomness, so identical input produces byte-identical output.
 The core execution path is split by responsibility: scenario normalization
 (:mod:`.scenario`), the deterministic event queue (:mod:`.events`), network
 delivery and fault determination (:mod:`.network`), node state transitions
-(:mod:`.protocol`) and final report generation (:mod:`.report`). The
+(:mod:`.protocol`, itself decomposed into per-domain mixins) and final
+report generation (:mod:`.report`). The
 ``simulate``, ``explore`` and ``replay`` entry points all run through the
 single :class:`_Simulator` core below.
 """
