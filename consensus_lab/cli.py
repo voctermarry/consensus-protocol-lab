@@ -4,12 +4,38 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 
 from . import __version__
 from .explore import run_explore
 from .replay import run_replay
 from .simulate import ScenarioError, run_simulation
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite number is not valid JSON: {value}")
+
+
+def _parse_finite_float(value: str) -> float:
+    # Reject JSON numbers whose magnitude overflows float (e.g. 1e999);
+    # they would otherwise decode silently to inf.
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite number is not valid JSON: {value}")
+    return number
+
+
+def _loads_strict_json(text: str) -> object:
+    """Decode JSON, rejecting NaN/Infinity/-Infinity literals and any
+    number that does not decode to a finite value. String values and
+    object keys are unaffected (parse_constant only fires on bare
+    literals)."""
+    return json.loads(
+        text,
+        parse_constant=_reject_json_constant,
+        parse_float=_parse_finite_float,
+    )
 
 
 def _cmd_simulate(path: str) -> int:
@@ -23,8 +49,8 @@ def _cmd_simulate(path: str) -> int:
         print(f"error: scenario file is not valid UTF-8: {path}", file=sys.stderr)
         return 2
     try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
+        raw = _loads_strict_json(text)
+    except (json.JSONDecodeError, ValueError) as exc:
         print(f"error: invalid JSON: {exc}", file=sys.stderr)
         return 2
     try:
@@ -47,8 +73,8 @@ def _cmd_explore(path: str) -> int:
         print(f"error: plan file is not valid UTF-8: {path}", file=sys.stderr)
         return 2
     try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
+        raw = _loads_strict_json(text)
+    except (json.JSONDecodeError, ValueError) as exc:
         print(f"error: invalid JSON: {exc}", file=sys.stderr)
         return 2
     try:
@@ -74,17 +100,13 @@ def _read_utf8_json(path: str, kind: str) -> tuple[bool, object]:
         print(f"error: {kind} file is not valid UTF-8: {path}", file=sys.stderr)
         return False, None
     try:
-        # parse_constant rejects the non-standard NaN/Infinity tokens that
-        # Python's decoder otherwise accepts; strict JSON treats them as
-        # syntax errors.
-        return True, json.loads(text, parse_constant=_reject_json_constant)
+        # Strict JSON: reject the non-standard NaN/Infinity tokens that
+        # Python's decoder otherwise accepts, and any number that decodes
+        # to a non-finite float (e.g. 1e999 overflowing to inf).
+        return True, _loads_strict_json(text)
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"error: invalid JSON in {kind} file: {exc}", file=sys.stderr)
         return False, None
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"invalid JSON token: {value}")
 
 
 def _cmd_replay(scenario_path: str, result_path: str) -> int:
