@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from itertools import combinations
 
-from .simulate import ScenarioError, _Simulator, _require_int, parse_scenario
+from .scenario import ScenarioError, _require_int, parse_scenario
+from .simulate import _Simulator
 
 _PLAN_FIELDS = {
     "scenario",

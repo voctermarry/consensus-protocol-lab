@@ -10,7 +10,8 @@ import sys
 from . import __version__
 from .explore import run_explore
 from .replay import run_replay
-from .simulate import ScenarioError, run_simulation
+from .scenario import ScenarioError
+from .simulate import run_simulation
 
 
 def _reject_json_constant(value: str) -> None:
