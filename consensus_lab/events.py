@@ -40,15 +40,37 @@ class EventQueue:
     """A deterministic priority queue of ``(time, kind, order, payload)``
     events. ``order`` is a monotonically assigned sequence number per
     scheduling site, so events comparing equal on ``(time, kind)`` drain in
-    scheduling order and the payload never takes part in comparisons."""
+    scheduling order and the payload never takes part in comparisons.
 
-    __slots__ = ("_heap",)
+    While staging is active, ``push`` collects events into a side batch
+    instead of the live heap; the batch is later either committed to the
+    heap or discarded wholesale (a storage fault suppresses every event a
+    failed persistence barrier scheduled)."""
+
+    __slots__ = ("_heap", "_staging")
 
     def __init__(self) -> None:
         self._heap: list[tuple] = []
+        self._staging: list[tuple] | None = None
 
     def push(self, item: tuple) -> None:
-        heapq.heappush(self._heap, item)
+        if self._staging is not None:
+            self._staging.append(item)
+        else:
+            heapq.heappush(self._heap, item)
+
+    def begin_staging(self) -> None:
+        """Start collecting pushed events into a side batch; the batch never
+        interleaves with the live heap until committed."""
+        self._staging = []
+
+    def commit_staging(self) -> None:
+        staged, self._staging = self._staging, None
+        for item in staged:
+            heapq.heappush(self._heap, item)
+
+    def discard_staging(self) -> None:
+        self._staging = None
 
     def pop(self) -> tuple:
         return heapq.heappop(self._heap)

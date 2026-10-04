@@ -24,6 +24,7 @@ _TOP_LEVEL_FIELDS = {
     "readQueries",
     "livenessChecks",
     "preVote",
+    "storageFaults",
 }
 _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "faults",
@@ -36,6 +37,7 @@ _REQUIRED_FIELDS = _TOP_LEVEL_FIELDS - {
     "readQueries",
     "livenessChecks",
     "preVote",
+    "storageFaults",
 }
 _FAULT_FIELDS = {"time", "action", "groups"}
 _MESSAGE_FAULT_FIELDS = {"from", "to", "message", "occurrence", "action", "delay"}
@@ -58,6 +60,8 @@ _MESSAGE_KINDS = (
 _PRE_VOTE_MESSAGE_KINDS = ("preVote", "preVoteReply")
 _CLIENT_COMMAND_FIELDS = {"time", "node", "id", "command"}
 _NODE_EVENT_FIELDS = {"time", "node", "action"}
+_STORAGE_FAULT_FIELDS = {"node", "occurrence", "restartDelay"}
+_STORAGE_FAULT_REQUIRED = {"node", "occurrence"}
 _MEMBERSHIP_CHANGE_FIELDS = {"time", "node", "id", "action", "member"}
 _READ_QUERY_FIELDS = {"time", "node", "id"}
 _LIVENESS_CHECK_FIELDS = {"id", "type", "startTime", "deadline", "target"}
@@ -326,6 +330,48 @@ def parse_scenario(raw: object) -> dict:
         last_action[node] = action
         normalized_node_events.append({"time": time, "node": node, "action": action})
 
+    # Storage faults inject crashes at a node's numbered persistence
+    # barriers and schedule the automatic restart themselves, so they
+    # cannot be combined with an explicit crash/restart schedule.
+    storage_faults_provided = "storageFaults" in raw
+    storage_faults = raw.get("storageFaults", [])
+    if storage_faults_provided and node_events_provided:
+        raise ScenarioError("storageFaults and nodeEvents must not be provided together")
+    if not isinstance(storage_faults, list):
+        raise ScenarioError("storageFaults must be a list")
+    normalized_storage_faults = []
+    seen_storage_selectors: dict[tuple, int] = {}
+    for index, storage_fault in enumerate(storage_faults):
+        label = f"storageFaults[{index}]"
+        if not isinstance(storage_fault, dict):
+            raise ScenarioError(f"{label} must be an object")
+        unknown = sorted(set(storage_fault) - _STORAGE_FAULT_FIELDS)
+        if unknown:
+            raise ScenarioError(f"{label} has unknown field(s): {', '.join(unknown)}")
+        missing = sorted(_STORAGE_FAULT_REQUIRED - set(storage_fault))
+        if missing:
+            raise ScenarioError(f"{label} missing field(s): {', '.join(missing)}")
+        node = storage_fault["node"]
+        if not isinstance(node, str) or not node:
+            raise ScenarioError(f"{label}.node must be a non-empty string")
+        if node not in node_set:
+            raise ScenarioError(f"{label}.node references unknown node: {node!r}")
+        occurrence = _require_int(storage_fault["occurrence"], f"{label}.occurrence", 1)
+        restart_delay = None
+        if "restartDelay" in storage_fault:
+            restart_delay = _require_int(
+                storage_fault["restartDelay"], f"{label}.restartDelay", 0
+            )
+        selector = (node, occurrence)
+        if selector in seen_storage_selectors:
+            raise ScenarioError(
+                f"{label} duplicates the selector of storageFaults[{seen_storage_selectors[selector]}]"
+            )
+        seen_storage_selectors[selector] = index
+        normalized_storage_faults.append(
+            {"node": node, "occurrence": occurrence, "restartDelay": restart_delay}
+        )
+
     snapshot_threshold = None
     if "snapshotThreshold" in raw:
         snapshot_threshold = _require_int(
@@ -532,6 +578,7 @@ def parse_scenario(raw: object) -> dict:
         "clientCommands": normalized_commands,
         "nodeEvents": normalized_node_events,
         "nodeEventsProvided": node_events_provided,
+        "storageFaults": normalized_storage_faults,
         "snapshotThreshold": snapshot_threshold,
         "membershipEnabled": membership_enabled,
         "initialMembers": initial_members,

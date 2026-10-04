@@ -196,7 +196,9 @@ def _node_report(sim, name: str, st: _Node) -> dict:
             }
         else:
             report["snapshot"] = None
-    if sim.node_events_provided:
+    if sim.node_events_provided or sim.storage_faults_active:
+        # Crash/restart lifecycle fields: explicit node events or injected
+        # storage faults (the two never coexist in one scenario).
         report["online"] = st.online
         report["restartCount"] = st.restart_count
     return report

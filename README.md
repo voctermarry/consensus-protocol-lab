@@ -61,6 +61,11 @@ consensus-protocol-lab --help               # 打印用法
   - `time`：`[0, duration]` 内的非负整数虚拟时间。
   - `node`：已有节点名。
   - `action`：`crash` 或 `restart`。同一节点的事件必须从 `crash` 开始并严格交替。
+- `storageFaults`（可选）：稳定存储故障规则列表，按节点的持久化屏障序号注入写入失败，不得与 `nodeEvents` 同时提供。每项包含：
+  - `node`：已有节点名（非空字符串）。
+  - `occurrence`：正整数，命中该节点整次仿真中第几个持久化屏障（跨自动重启连续计数）。一次屏障指一次使 `term`、`votedFor`、`log`、`snapshot`、`commitIndex`、`lastApplied`、`applied` 中至少一项发生净变化的事件处理；其全部持久化变更作为一次原子保存。
+  - `restartDelay`（可选）：非负整数虚拟毫秒，失败后等待自动重启的时间；省略时节点保持离线。
+  - 同一 `node` 与 `occurrence` 组合不得重复；未命中的规则不报错、不产生事件。省略该字段（或为空列表）时，既有合法场景输出逐字节不变。
 - `snapshotThreshold`（可选）：正整数。节点顺序应用提交项后，若 `lastApplied` 距上次快照位置达到该阈值，就在 `lastApplied` 处保存快照（索引、任期与已应用状态）并删除此前日志。未提供时不启用快照，输出逐字节不变。
 - `initialMembers`（可选，必须与 `membershipChanges` 同时提供或同时省略）：初始投票集合，是 `nodes` 的一个至少含三个不重复名称的子集；其余节点为 learner，不参选也不投票。
 - `membershipChanges`（可选，与 `initialMembers` 成对出现）：成员变更请求列表，按输入顺序提供 `time`、`node`、`id`、`action` 与 `member`：
@@ -91,6 +96,10 @@ consensus-protocol-lab --help               # 打印用法
 - 节点在线时，任期、投票、日志、`commitIndex`、`lastApplied` 与 `applied` 的每次变化都在相关响应之前同步持久化（leader 接受命令前先持久化日志）；持久化不读取墙钟、不使用随机数。
 - `crash` 后节点离线：不发送或处理任何消息，不触发选举超时、心跳或客户命令；发往离线节点的消息在到达时记为 `dropped`/`nodeDown`，而崩溃前已发出的消息仍按原时间投递。发给离线节点的客户命令记为 `rejected`/`nodeDown`，`knownLeader` 为 `null`。
 - `restart` 恢复持久化状态（`term`、`votedFor`、`log`、快照、`commitIndex`、`lastApplied`、`applied`），以 follower、`knownLeader` 为 `null` 上线，清空候选票与 leader 复制进度，选举超时从重启时刻重新计算；已恢复的条目不会重复应用。
+- 提供 `storageFaults` 后，每个可能改变节点持久化状态的事件处理（消息投递、客户命令、成员变更、只读查询、选举超时、心跳）都构成一次候选持久化屏障：处理前后对比 `term`、`votedFor`、`log`、`snapshot`、`commitIndex`、`lastApplied`、`applied`，有净变化即该节点的下一个屏障，其全部变更作为一次原子保存。
+  - 规则命中某次屏障时，timeline 先记录 `storageFault`（含 `node`、`occurrence` 与 `fields`；`fields` 只列本次拟保存且改变的字段，固定按 `term`、`votedFor`、`log`、`snapshot`、`commitIndex`、`lastApplied`、`applied` 顺序），失败的更新不写入持久化镜像，节点随即在同一时刻按既有 `crash` 语义崩溃；依赖该更新的消息、响应、状态变化与客户结果一律不对外可见（含其占用的 `messageFaults` 发送序号），故障前已发出的消息仍按计划到达。
+  - 设置 `restartDelay` 时，节点在崩溃时刻加该延迟后按既有 `restart` 语义恢复最后成功保存的完整状态，清空易失状态并重建选举超时；零延迟也先记录崩溃与重启，再处理同刻剩余事件；重启时刻超过 `duration` 时不执行重启。省略 `restartDelay` 时节点保持离线，发往它的消息、写入与查询沿用 `nodeDown` 语义。
+  - 屏障序号在整次仿真中按节点连续计数（跨自动重启不间断）；未改变任何持久化字段的处理不构成屏障，不消耗序号。汇总与不变量报告均按实际轨迹计算；提供非空 `storageFaults` 时，节点报告与 `nodeEvents` 一样另含 `online` 与 `restartCount`。
 - 启用 `snapshotThreshold` 后：剩余日志继续使用全局索引，选举比较、前缀匹配、`commitIndex` 与 `lastApplied` 均不重新编号；快照与剩余日志一并持久化，重启后恢复，快照内命令不会再次产生 `applied` 事件。
 - leader 发现 follower 的 `nextIndex` 已被自身快照覆盖时发送 `installSnapshot`（携带 `lastIncludedIndex`、`lastIncludedTerm` 与快照内已应用状态），沿用现有延迟、乱序、分区与离线规则。follower 对旧任期消息返回 `staleTerm`；同任期且 `lastIncludedIndex` 不大于本地快照位置时返回 `ignored`；接受新快照时恢复状态，将 `commitIndex` 与 `lastApplied` 至少推进到该位置，仅当本地同索引条目任期相同才保留其后的日志，否则删除后缀，返回 `installed`。leader 收到 `installed` 后从快照后一项继续复制。更高任期仍使接收方转为 follower，同刻处理顺序、全局 `seq` 与确定性输出保持不变。
 - 启用联合共识成员变更后：
@@ -131,13 +140,14 @@ consensus-protocol-lab --help               # 打印用法
   - `snapshotCreated`：节点在应用后保存快照（含 `node`、`lastIncludedIndex`、`lastIncludedTerm`），仅在提供 `snapshotThreshold` 时出现。
   - `snapshotInstalled`：follower 接受 `installSnapshot`（含 `node`、`peer`、`lastIncludedIndex`、`lastIncludedTerm`），仅在提供 `snapshotThreshold` 时出现。
   - 快照消息 `installSnapshot`/`installSnapshotReply` 的发送与 `messageResult`（`installed`、`ignored`、`staleTerm`、`higherTerm`，跨分区或离线投递为 `dropped`）。
-  - `nodeLifecycle`：节点 `crash` 或 `restart`（含 `node`、`action`），仅在提供 `nodeEvents` 时出现。
+  - `nodeLifecycle`：节点 `crash` 或 `restart`（含 `node`、`action`），仅在提供 `nodeEvents` 或 `storageFaults` 规则时出现。
+  - `storageFault`：一条 `storageFaults` 规则命中某次持久化屏障（含 `node`、`occurrence` 与按固定顺序列出本次拟保存且改变字段的 `fields`），随后同刻记录 `nodeLifecycle` 的 `crash`（及设置 `restartDelay` 时的 `restart`），仅在提供 `storageFaults` 且规则命中时出现。
   - `readResult`：只读查询结果。`accepted`（含 `term`、`readIndex`）、`completed`（含 `term`、`readIndex`）或 `rejected`（含 `reason`，取值 `nodeDown`/`notLeader`/`leadershipLost`，及 `knownLeader`），仅在提供 `readQueries` 时出现；确认消息 `readProbe`/`readReply` 的发送与 `messageResult` 均携带查询 `id`。
   - `membershipResult`：成员变更请求结果。`accepted`（add 且尚未追加联合项时含 `phase: "catchingUp"`）或 `rejected`（含 `reason`，取值 `nodeDown`/`notLeader`/`changeInProgress`/`alreadyMember`/`notMember`/`minimumClusterSize`），仅在提供成员变更字段时出现。
   - `configurationApplied`：节点按索引应用一个已提交配置项（含 `index`、`term`、`id`、`entryType` 为 `joint`/`stable`、`config`、`action`、`member`），仅在提供成员变更字段时出现。
   - 复制配置项的 `appendEntries` 消息结果另含 `configEntries`（每项含 `index`、`id`、`entryType`），与客户命令复制明确区分。
   - `livenessResult`：活性检查的最终结果，位于同刻全部既有事件（含零延迟反应）之后（仅在提供 `livenessChecks` 时出现）。含检查 `id`、`checkType`（检查类型，取值同输入 `type`）、`status` 为 `satisfied`/`failed`；带 target 的检查另含 `target`，失败另含 `reason`（`targetRejected`/`targetSuperseded`/`deadlineExceeded`）。结果发生时刻由外层 `time` 给出。
-- `nodes`：各节点最终的 `role`、`term`、`votedFor`、`knownLeader`，以及 `log`（仅含未压缩后缀，仍带全局 `index`/`term`/`id`/`command`；启用成员变更时客户命令条目含 `kind: "command"`，配置项含 `kind: "config"`、`entryType`、`config`、`action`、`member`）、`commitIndex`、`lastApplied`、`applied`（同样以 `kind` 区分两类条目）；提供 `snapshotThreshold` 时另含 `snapshot`（`{"lastIncludedIndex", "lastIncludedTerm"}`，未创建快照时为 `null`）；提供 `nodeEvents` 时另含 `online` 与 `restartCount`；提供成员变更字段时另含 `membershipRole`（按该节点最新配置取 `voter` 或 `learner`）。启用 `preVote` 时 `role` 可以是 `preCandidate`（其 `term`/`votedFor` 仍为预投票前的持久化值），但 `electionSafety` 只统计正式当选的 leader。
+- `nodes`：各节点最终的 `role`、`term`、`votedFor`、`knownLeader`，以及 `log`（仅含未压缩后缀，仍带全局 `index`/`term`/`id`/`command`；启用成员变更时客户命令条目含 `kind: "command"`，配置项含 `kind: "config"`、`entryType`、`config`、`action`、`member`）、`commitIndex`、`lastApplied`、`applied`（同样以 `kind` 区分两类条目）；提供 `snapshotThreshold` 时另含 `snapshot`（`{"lastIncludedIndex", "lastIncludedTerm"}`，未创建快照时为 `null`）；提供 `nodeEvents` 或非空 `storageFaults` 时另含 `online` 与 `restartCount`；提供成员变更字段时另含 `membershipRole`（按该节点最新配置取 `voter` 或 `learner`）。启用 `preVote` 时 `role` 可以是 `preCandidate`（其 `term`/`votedFor` 仍为预投票前的持久化值），但 `electionSafety` 只统计正式当选的 leader。
 - `membership`（仅在提供成员变更字段时出现）：
   - `initial`：初始投票集合；`current`：当前已提交的稳定投票集合（联合阶段仍为旧稳定集合）；`joint`：联合阶段为 `{"id", "old", "new"}`，否则为 `null`。
   - `changes`：按输入顺序给出每个 id 的结局：`committed`（含稳定配置项的 `index`、`term`）、`pending`（含 `phase: "catchingUp"` 或 `phase: "joint"`，后者另含 `joint`）或 `rejected`（含 `reason`）。
@@ -156,11 +166,11 @@ consensus-protocol-lab --help               # 打印用法
 - `logMatching`：`violations` 列出“同索引同任期但内容（客户命令的 id/command，或配置项负载）不同”的情况；跨配置项与快照边界检查（已压缩索引取自已应用历史）。
 - `stateMachineSafety`：`violations` 列出不同节点在同一索引应用了不同条目的情况（配置项与客户命令一并参与索引对齐，并跨快照边界检查）。
 
-未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息；未同时提供 `initialMembers` 与 `membershipChanges` 时，不新增 `membership` 汇总、`membershipRole`、成员事件与配置项标记；未提供 `messageFaults` 时，不新增 `messageFault` 事件与 `messageFault` 原因的丢弃结果；未提供 `livenessChecks` 时，不新增 `livenessResult` 事件与 `liveness` 顶层字段；省略 `preVote` 或其为 `false` 时，不新增 `preCandidate` 角色、`preVote`/`preVoteReply` 消息与 `round`/`prospectiveTerm` 字段，既有合法场景的输出逐字节不变。
+未提供 `clientCommands` 时，所有节点日志为空、`clients` 四类皆为空列表、两个新增报告为空，且原选举轨迹与既有字段值保持不变。未提供 `nodeEvents` 时，不新增 `nodeLifecycle` 事件与 `online`/`restartCount` 字段；未提供 `storageFaults`（或其为空列表）时，不新增 `storageFault` 事件、`nodeLifecycle` 事件与 `online`/`restartCount` 字段，既有合法场景输出逐字节不变；未提供 `snapshotThreshold` 时，不新增 `snapshot` 字段、快照事件与快照消息；未同时提供 `initialMembers` 与 `membershipChanges` 时，不新增 `membership` 汇总、`membershipRole`、成员事件与配置项标记；未提供 `messageFaults` 时，不新增 `messageFault` 事件与 `messageFault` 原因的丢弃结果；未提供 `livenessChecks` 时，不新增 `livenessResult` 事件与 `liveness` 顶层字段；省略 `preVote` 或其为 `false` 时，不新增 `preCandidate` 角色、`preVote`/`preVoteReply` 消息与 `round`/`prospectiveTerm` 字段，既有合法场景的输出逐字节不变。
 
 ### 错误
 
-文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复、`readQueries` 非列表或条目的字段缺失/未知、时间越界、节点未知、id 非法或与客户命令/成员变更/其他查询的 id 重复、`livenessChecks` 非列表或条目的字段缺失/未知、`id` 非空且唯一、`type` 非法、时间越界或 `startTime` 大于 `deadline`、`leaderElected` 携带 target、其他类型缺失 target、target 不是非空字符串或引用了不存在的客户命令/查询/成员变更 id、`preVote` 不是 JSON 布尔值、关闭预投票时在 `messageFaults` 中引用 `preVote` 或 `preVoteReply` 时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
+文件不可读、非 UTF-8、JSON 语法错误、字段缺失或未知、节点引用非法、故障超界或分区不合法、`messageFaults` 非列表或条目的字段缺失/未知、节点非法或两端相同、消息类型非法、`occurrence` 非正整数、`action` 非法、`drop` 携带 `delay`、`delay` 缺失或不是非负整数、完整选择器重复、`clientCommands` 的字段/类型/时间/节点/id 非法或 id 重复、`nodeEvents` 的字段/取值/节点引用/时间非法或同一节点未从 `crash` 开始严格交替、`snapshotThreshold` 为布尔值、非整数或小于一、`initialMembers` 与 `membershipChanges` 只出现一个、`initialMembers` 少于三个/重复/引用未知节点、`membershipChanges` 的字段/时间/取值/接收节点/目标节点非法或 id（含与客户命令 id）重复、`readQueries` 非列表或条目的字段缺失/未知、时间越界、节点未知、id 非法或与客户命令/成员变更/其他查询的 id 重复、`livenessChecks` 非列表或条目的字段缺失/未知、`id` 非空且唯一、`type` 非法、时间越界或 `startTime` 大于 `deadline`、`leaderElected` 携带 target、其他类型缺失 target、target 不是非空字符串或引用了不存在的客户命令/查询/成员变更 id、`preVote` 不是 JSON 布尔值、关闭预投票时在 `messageFaults` 中引用 `preVote` 或 `preVoteReply`、`storageFaults` 与 `nodeEvents` 同时提供、`storageFaults` 非列表或条目的字段缺失/未知、节点未知、`occurrence` 非正整数、`restartDelay` 不是非负整数或 `(node, occurrence)` 选择器重复时，不输出部分结果：标准错误写一行以 `error: ` 开头的说明并返回退出码 2。
 
 ## explore 子命令
 
@@ -170,7 +180,7 @@ consensus-protocol-lab --help               # 打印用法
 
 PLAN 是一个 JSON 对象，包含以下四个必填字段，未知字段会被拒绝；另有可选字段 `minimizeFailures`，以及必须同时提供或同时省略的 `eventCandidates` 与 `maxEventFaults`：
 
-- `scenario`（必填）：与 `simulate` 相同的场景对象，但不得包含 `messageFaults` 字段；可保留固定的 `faults` 与 `nodeEvents`。
+- `scenario`（必填）：与 `simulate` 相同的场景对象，但不得包含 `messageFaults` 字段；可保留固定的 `faults`、`nodeEvents` 与 `storageFaults`（不新增对应的候选类型）。
 - `candidates`（必填）：非空的消息故障规则数组，每项按 `simulate` 的 `messageFaults` 规则原样校验（含对场景节点的引用检查），完整选择器 `(from, to, message, occurrence)` 不得重复；`preVote`/`preVoteReply` 候选仅在场景 `preVote: true` 时合法。
 - `maxFaults`（必填）：零至候选规则数的整数（非布尔），每个组合至多选用的规则数。
 - `maxCases`（必填）：正整数（非布尔），允许的组合总数上限。
